@@ -25,7 +25,9 @@
 #ifndef __QTUI__
 #define __QTUI__
 
+#include <algorithm>
 #include <cassert>
+#include <cstdlib>
 #include <cmath>
 #include <fstream>
 #include <iostream>
@@ -90,6 +92,66 @@
 #define minValue minimum
 #define maxValue maximum
 
+//==============================THEME (Luca Spanedda)================================
+//
+// Colors of the widgets painted by hand (knobs, bargraphs, LEDs), which the
+// stylesheet cannot reach. Keep them in sync with Styles/Grey.qss (light) and
+// Styles/GreyDark.qss (dark).
+//
+// Theme mode: 0 = follow the macOS appearance (Qt >= 6.5), 1 = light, 2 = dark.
+// Initial value: FAUST_THEME=system|light|dark in the environment, otherwise the
+// last choice made with the theme button (saved per application), otherwise
+// FQT_THEME_DEFAULT (set by 'faust2caqt -theme ...'), otherwise 0.
+//
+#ifndef FQT_THEME_DEFAULT
+#define FQT_THEME_DEFAULT 0
+#endif
+
+static inline int& fqtThemeMode()
+{
+    static int mode = -1;
+    if (mode == -1) {
+        const char* t = getenv("FAUST_THEME");
+        std::string env = t ? t : "";
+        if (env == "system") mode = 0;
+        else if (env == "light") mode = 1;
+        else if (env == "dark") mode = 2;
+        else mode = QSettings("Faust", QCoreApplication::applicationName()).value("theme", FQT_THEME_DEFAULT).toInt();
+        if (mode < 0 || mode > 2) mode = 0;
+    }
+    return mode;
+}
+
+static inline bool fqtDark()
+{
+    if (fqtThemeMode() != 0) return fqtThemeMode() == 2;
+#if QT_VERSION >= QT_VERSION_CHECK(6, 5, 0)
+    return QGuiApplication::styleHints()->colorScheme() == Qt::ColorScheme::Dark;
+#else
+    return false;
+#endif
+}
+
+#define FQT_COLOR(light, dark)  (fqtDark() ? QColor(dark) : QColor(light))
+#define FQT_ACCENT      FQT_COLOR(0x1d1d1f, 0xf2f2f4)   // controls: knob arc, slider fill
+#define FQT_SIGNAL      FQT_COLOR(0x48484e, 0xc4c4ca)   // signals: linear bargraphs, LEDs
+#define FQT_TRACK       FQT_COLOR(0xe6e6ea, 0x3a3a3f)   // empty part of knobs and meters
+#define FQT_BORDER      FQT_COLOR(0xcfcfd4, 0x4a4a50)   // thin outline of meters and knobs
+#define FQT_KNOB_TOP    FQT_COLOR(0xffffff, 0x4a4a50)   // knob face, top of the gradient
+#define FQT_KNOB_BOTTOM FQT_COLOR(0xececf0, 0x323236)   // knob face, bottom of the gradient
+#define FQT_TEXT        FQT_COLOR(0x1d1d1f, 0xf2f2f4)   // pointer, scale text
+#define FQT_TEXT_DIM    FQT_COLOR(0x86868b, 0x8e8e93)   // dB scale marks
+
+// Compact sizes, so that more controls fit in a window without scrolling
+#define FQT_SLIDER_LENGTH   120     // was 160
+#define FQT_SLIDER_THICK    24      // was 34
+#define FQT_METER_LENGTH    120     // was 128 (linear) / 256 (dB)
+#define FQT_METER_THICK     12      // was 16 / 18
+#define FQT_KNOB_WIDTH      60      // was 64
+#define FQT_KNOB_HEIGHT     92      // was 100
+#define FQT_BOX_MARGIN      4       // was 5
+#define FQT_BOX_SPACING     4
+
 //==============================BEGIN QSYNTHKNOB=====================================
 //
 //   qsynthknob and qsynthDialVokiStyle borrowed from qsynth-0.3.3 by Rui Nuno Capela
@@ -120,7 +182,58 @@ public:
         
         const QStyleOptionSlider* dial = qstyleoption_cast<const QStyleOptionSlider*>(opt);
         if (dial == NULL) return;
-        
+
+#ifndef FQT_CLASSIC_KNOB
+        // Flat knob: grey track arc, colored value arc, light face and dark pointer
+        {
+            double v = double(dial->sliderValue - dial->minimum) / double(dial->maximum - dial->minimum);
+            double a = DIAL_MIN + DIAL_RANGE * v;
+            int side = qMin(dial->rect.width(), dial->rect.height());
+            QPointF c = QRectF(dial->rect).center();
+            double arcW = qMax(3.0, side * 0.09);
+            QRectF arc(c.x() - side / 2.0 + arcW, c.y() - side / 2.0 + arcW, side - 2 * arcW, side - 2 * arcW);
+            bool on = (dial->state & State_Enabled);
+
+            p->save();
+            p->setRenderHint(QPainter::Antialiasing, true);
+
+            QPen pen(FQT_TRACK, arcW, Qt::SolidLine, Qt::RoundCap);
+            p->setPen(pen);
+            p->drawArc(arc, 225 * 16, -270 * 16);
+            pen.setColor(on ? FQT_ACCENT : FQT_BORDER);
+            p->setPen(pen);
+            p->drawArc(arc, 225 * 16, int(-270 * 16 * v));
+
+            double r = arc.width() / 2.0 - arcW * 1.2;
+            // soft drop shadow
+            QRadialGradient shadow(c + QPointF(0, r * 0.12), r * 1.15);
+            shadow.setColorAt(0.80, QColor(0, 0, 0, fqtDark() ? 90 : 40));
+            shadow.setColorAt(1.00, QColor(0, 0, 0, 0));
+            p->setPen(Qt::NoPen);
+            p->setBrush(shadow);
+            p->drawEllipse(c + QPointF(0, r * 0.12), r * 1.15, r * 1.15);
+            // face
+            QLinearGradient face(c.x(), c.y() - r, c.x(), c.y() + r);
+            face.setColorAt(0, FQT_KNOB_TOP);
+            face.setColorAt(1, FQT_KNOB_BOTTOM);
+            p->setPen(QPen(FQT_BORDER, 1));
+            p->setBrush(face);
+            p->drawEllipse(c, r, r);
+
+            QPointF tip(c.x() - (r - 3) * sin(a), c.y() + (r - 3) * cos(a));
+            QPointF base(c.x() - r * 0.45 * sin(a), c.y() + r * 0.45 * cos(a));
+            p->setPen(QPen(on ? FQT_ACCENT : FQT_TEXT_DIM, qMax(2.0, side / 24.0), Qt::SolidLine, Qt::RoundCap));
+            p->drawLine(base, tip);
+
+            if (dial->state & State_HasFocus) {
+                p->setPen(QPen(FQT_ACCENT, 1));
+                p->setBrush(Qt::NoBrush);
+                p->drawEllipse(c, r + 1, r + 1);
+            }
+            p->restore();
+            return;
+        }
+#endif
         double angle = DIAL_MIN // offset
         + (DIAL_RANGE *
            (double(dial->sliderValue - dial->minimum) /
@@ -429,7 +542,7 @@ protected:
     virtual void paintEvent(QPaintEvent*)
     {
         QPainter painter(this);
-        painter.drawRect(rect());
+        painter.fillRect(rect(), FQT_TRACK);
         
         if (fValue <= fLevel[0]) {
             // interpolate the first color on the alpha channel
@@ -443,6 +556,8 @@ protected:
             size_t l = fLevel.size()-1; while (fValue < fLevel[l] && l > 0) l--;
             painter.fillRect(rect(), fBrush[l]);
         }
+        painter.setPen(FQT_BORDER);
+        painter.drawRect(rect().adjusted(0, 0, -1, -1));
     }
     
 public:
@@ -455,7 +570,7 @@ public:
     
     virtual QSize sizeHint() const
     {
-        return QSize(16, 8);
+        return QSize(18, 10);
     }
 };
 
@@ -475,24 +590,26 @@ protected:
     virtual void paintEvent(QPaintEvent*)
     {
         QPainter painter(this);
-        painter.drawRect(rect());
+        painter.fillRect(rect(), FQT_TRACK);
         // interpolate the first color on the alpha channel
-        QColor c = fColor ;
+        QColor c = FQT_SIGNAL;
         FAUSTFLOAT a = (fValue-fMin)/(fMax-fMin);
         c.setAlphaF(a);
         painter.fillRect(rect(), c);
+        painter.setPen(FQT_BORDER);
+        painter.drawRect(rect().adjusted(0, 0, -1, -1));
     }
     
 public:
     
-    LED(FAUSTFLOAT lo, FAUSTFLOAT hi) : AbstractDisplay(lo, hi), fColor("yellow")
+    LED(FAUSTFLOAT lo, FAUSTFLOAT hi) : AbstractDisplay(lo, hi)
     {
         setSizePolicy(QSizePolicy::Fixed, QSizePolicy::Fixed);
     }
     
     virtual QSize sizeHint() const
     {
-        return QSize(16, 8);
+        return QSize(18, 10);
     }
 };
 
@@ -504,14 +621,14 @@ class linBargraph : public AbstractDisplay
     
 protected:
     
-    QBrush fBrush;
     
     /**
      * No scale implemented yet
      */
     void paintScale(QPainter* painter) const
     {
-        painter->drawRect(0, 0, width(), height());
+        painter->setPen(FQT_BORDER);
+        painter->drawRect(0, 0, width() - 1, height() - 1);
     }
     
     /**
@@ -522,13 +639,14 @@ protected:
         int w = width();
         int h = height();
         FAUSTFLOAT v = (fValue-fMin)/(fMax-fMin);
+        painter->fillRect(0, 0, w, h, FQT_TRACK);
         
         if (h > w) {
             // draw vertical rectangle
-            painter->fillRect(0, (1-v)*h, w, v*h, fBrush);
+            painter->fillRect(0, (1-v)*h, w, v*h, FQT_SIGNAL);
         } else {
             // draw horizontal rectangle
-            painter->fillRect(0, 0, v*w, h, fBrush);
+            painter->fillRect(0, 0, v*w, h, FQT_SIGNAL);
         }
     }
     
@@ -545,15 +663,6 @@ public:
     {
         // compute the brush that will be used to
         // paint the value
-        QColor c(0xffa500);                 // orange
-        int x = int(height() < width());    // gradient direction
-        QLinearGradient g(0,0,x,1-x);
-        g.setCoordinateMode(QGradient::ObjectBoundingMode);
-        g.setColorAt(0.0, c.lighter());
-        g.setColorAt(0.2, c);
-        g.setColorAt(0.8, c);
-        g.setColorAt(0.9, c.darker(120));
-        fBrush = QBrush(g);
     }
 };
 
@@ -572,7 +681,7 @@ public:
     
     virtual QSize sizeHint() const
     {
-        return QSize(16, 128);
+        return QSize(FQT_METER_THICK, FQT_METER_LENGTH);
     }
 };
 
@@ -591,7 +700,7 @@ public:
     
     virtual QSize sizeHint() const
     {
-        return QSize(128, 16);
+        return QSize(FQT_METER_LENGTH, FQT_METER_THICK);
     }
 };
 
@@ -616,9 +725,9 @@ protected:
      */
     void paintScale(QPainter* painter) const
     {
-        painter->fillRect(0,0,width(),height(), fBackColor);
+        painter->fillRect(0,0,width(),height(), FQT_TRACK);
         painter->save();
-        painter->setPen(QColor(0x6699aa)); //0xffa500));
+        painter->setPen(FQT_TEXT_DIM);
         for (FAUSTFLOAT v = -10; v > fMin; v -= 10) paintMark(painter, v);
         for (FAUSTFLOAT v = -6; v < fMax; v += 3) paintMark(painter, v);
         painter->restore();
@@ -641,7 +750,8 @@ protected:
         if (n == l) n = n-1;
         p=paintSegment(painter, p, fValue, fBrush[n]);
         
-        painter->drawRect(0,0,width(),height());
+        painter->setPen(FQT_BORDER);
+        painter->drawRect(0,0,width()-1,height()-1);
     }
     
     virtual void paintEvent(QPaintEvent*)
@@ -656,9 +766,9 @@ public:
     dbBargraph(FAUSTFLOAT lo, FAUSTFLOAT hi) : dbAbstractDisplay(lo,hi)
     {
         QFont f = this->font();
-        f.setPointSize(6);
+        f.setPointSize(8);
         this->setFont(f);
-        fBackColor = QBrush(QColor(20,20,20));
+        fBackColor = QBrush(FQT_TRACK);
     }
 };
 
@@ -717,7 +827,7 @@ public:
     
     virtual QSize sizeHint() const
     {
-        return QSize(18, 256);
+        return QSize(FQT_METER_THICK + 14, FQT_METER_LENGTH + 40);
     }
 };
 
@@ -773,7 +883,7 @@ public:
     
     virtual QSize sizeHint() const
     {
-        return QSize(256, 18);
+        return QSize(FQT_METER_LENGTH + 40, FQT_METER_THICK + 6);
     }
     
 };
@@ -1212,6 +1322,7 @@ protected:
     QVBoxLayout*            fGeneralLayout;
     
     QPixmap                 fQrCode;
+    QToolButton*            fThemeButton = NULL;
     
     bool isTabContext()
     {
@@ -1277,22 +1388,22 @@ protected:
         std::map<std::string, std::string> metadata;
         std::string label;
         extractMetadata(fulllabel, label, metadata);
-        layout->QTSetMargins(5);
+        layout->QTSetMargins(FQT_BOX_MARGIN);
+        layout->setSpacing(FQT_BOX_SPACING);
         QWidget* box;
         
         label = startWith(label, "0x") ? "" : label;
+        if (label.find_first_not_of(" _") == std::string::npos) label = "";
         
         if (fGroupStack.empty()) {
             if (isTabContext()) {
                 box = new QWidget(this);
-                // set background color
-                QPalette pal = box->palette();
-                pal.setColor(box->backgroundRole(), QColor::fromRgb(150, 150, 150));
-                box->setPalette(pal);
+                box->setObjectName("tabPage");
                 
             } else if (label.size() > 0) {
                 QGroupBox* group = new QGroupBox(this);
                 group->setTitle(label.c_str());
+                group->setObjectName("topGroup");
                 box = group;
                 
             } else {
@@ -1310,10 +1421,7 @@ protected:
         } else {
             if (isTabContext()) {
                 box = new QWidget();
-                // set background color
-                QPalette pal = box->palette();
-                pal.setColor(box->backgroundRole(), QColor::fromRgb(150, 150, 150));
-                box->setPalette(pal);
+                box->setObjectName("tabPage");
                 
             } else if (label.size()>0) {
                 QGroupBox* group = new QGroupBox();
@@ -1334,6 +1442,34 @@ protected:
         }
         insert(label.c_str(), box);
         fGroupStack.push(box);
+    }
+    
+    /**
+     * The box opened around a single control (slider, knob, bargraph...) is only
+     * a caption: give it a name for the stylesheet and stop it from growing in
+     * the direction where its content has nothing to show.
+     */
+    /**
+     * Step used to choose the decimals of the value shown with a bargraph:
+     * 5 significant digits of the range, 6 decimals for huge ranges such as
+     * ma.MIN..ma.MAX (used to inspect signals with [style:numerical]).
+     */
+    static FAUSTFLOAT displayStep(FAUSTFLOAT min, FAUSTFLOAT max)
+    {
+        double range = double(max) - double(min);
+        if (!(range > 0) || range > 1e9) return FAUSTFLOAT(1e-6);
+        return FAUSTFLOAT(std::max(range / 1e5, 1e-6));
+    }
+    
+    void markControlBox(bool horizontal)
+    {
+        QWidget* box = fGroupStack.top();
+        box->setObjectName("control");
+        if (horizontal) {
+            box->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Maximum);
+        } else {
+            box->setSizePolicy(QSizePolicy::Maximum, QSizePolicy::Preferred);
+        }
     }
     
     void openTab(const char* label)
@@ -1382,6 +1518,7 @@ public:
         QScrollArea *sa = new QScrollArea(fMainWindow);
         
         sa->setWidgetResizable(true);
+        sa->setFrameShape(QFrame::NoFrame);
         sa->setWidget(this);
         
         fMainWindow->setCentralWidget(sa);
@@ -1395,7 +1532,7 @@ public:
     QString styleSheet()
     {
         QString styleSheet("");
-        QFile file(":/Grey.qss");
+        QFile file(fqtDark() ? ":/GreyDark.qss" : ":/Grey.qss");
         
         if (file.open(QIODevice::ReadOnly | QIODevice::Text)) {
             styleSheet = QLatin1String(file.readAll());
@@ -1536,13 +1673,104 @@ public:
         if (!fTimer) {
             fTimer = new QTimer(this);
             QObject::connect(fTimer, SIGNAL(timeout()), this, SLOT(update()));
-            fTimer->start(100);
+            fTimer->start(40);     // 25 fps: smoother bargraphs (was 100 ms)
         }
         
         if (fMainWindow) {
+            // The stylesheet changes the size of every widget: apply it before
+            // computing the window size (ca-qt.cpp applies it only after run())
+            if (!fThemeButton) {
+                addThemeButton();
+                applyTheme();
+#if QT_VERSION >= QT_VERSION_CHECK(6, 5, 0)
+                // follow the macOS appearance while the application is running
+                QObject::connect(QGuiApplication::styleHints(), &QStyleHints::colorSchemeChanged, this, [this]() {
+                    if (fqtThemeMode() == 0) applyTheme();
+                });
+#endif
+            }
+            fitWindowToContent();
             fMainWindow->show();
         }
         return true;
+    }
+    
+    /**
+     * Re-apply stylesheet and hand-painted colors after a theme change
+     */
+    void applyTheme()
+    {
+#if QT_VERSION >= QT_VERSION_CHECK(6, 8, 0)
+        // also switch the native macOS window (title bar, frame) and the default palette
+        static const Qt::ColorScheme schemes[] = { Qt::ColorScheme::Unknown, Qt::ColorScheme::Light, Qt::ColorScheme::Dark };
+        QGuiApplication::styleHints()->setColorScheme(schemes[fqtThemeMode()]);
+#endif
+        qApp->setStyleSheet(styleSheet());
+        if (fThemeButton) {
+            static const char* names[] = { "Theme: follow macOS", "Theme: light", "Theme: dark" };
+            static const char* icons[] = { "\u25D0", "\u25CB", "\u25CF" };   // half, empty, full circle
+            fThemeButton->setText(QString::fromUtf8(icons[fqtThemeMode()]));
+            fThemeButton->setToolTip(QString(names[fqtThemeMode()]) + "  (click to change)");
+        }
+        if (fMainWindow) fMainWindow->update();
+    }
+    
+    /**
+     * Small round button floating in the top right corner of the window:
+     * cycles follow macOS -> light -> dark, the choice is saved per application.
+     * It is not part of the layout, so it takes no space from the controls.
+     */
+    void addThemeButton()
+    {
+        fThemeButton = new QToolButton(fMainWindow);
+        fThemeButton->setObjectName("themeButton");
+        fThemeButton->setFixedSize(22, 22);
+        fThemeButton->setCursor(Qt::PointingHandCursor);
+        QObject::connect(fThemeButton, &QToolButton::clicked, this, [this]() {
+            fqtThemeMode() = (fqtThemeMode() + 1) % 3;
+            QSettings("Faust", QCoreApplication::applicationName()).setValue("theme", fqtThemeMode());
+            applyTheme();
+        });
+        fMainWindow->installEventFilter(this);
+        placeThemeButton();
+    }
+    
+    void placeThemeButton()
+    {
+        if (fThemeButton) {
+            fThemeButton->move(fMainWindow->width() - fThemeButton->width() - 6, 4);
+            fThemeButton->raise();
+        }
+    }
+    
+    bool eventFilter(QObject* obj, QEvent* event) override
+    {
+        if (obj == fMainWindow && event->type() == QEvent::Resize) placeThemeButton();
+        return QWidget::eventFilter(obj, event);
+    }
+    
+    /**
+     * Open the window as large as its content (the biggest tab page included),
+     * limited to the available screen area: scrollbars appear only if the
+     * interface is really bigger than the screen.
+     */
+    void fitWindowToContent()
+    {
+        ensurePolished();
+        adjustSize();
+        QSize content = sizeHint().expandedTo(minimumSizeHint());
+        QScreen* screen = QGuiApplication::primaryScreen();
+        QRect avail = screen ? screen->availableGeometry() : QRect(0, 0, 1440, 900);
+        // room for the title bar, and for a scrollbar if the other side does not fit
+        int w = content.width() + 2;
+        int h = content.height() + 2;
+        int maxW = avail.width() - 20;
+        int maxH = avail.height() - 40;
+        if (h > maxH) w += fMainWindow->style()->pixelMetric(QStyle::PM_ScrollBarExtent);
+        if (w > maxW) h += fMainWindow->style()->pixelMetric(QStyle::PM_ScrollBarExtent);
+        fMainWindow->resize(qMin(w, maxW), qMin(h, maxH));
+        fMainWindow->move(avail.x() + (avail.width() - fMainWindow->width()) / 2,
+                          avail.y() + qMax(0, (avail.height() - fMainWindow->height()) / 3));
     }
     
     virtual void stop()
@@ -1641,7 +1869,7 @@ public:
             return;
         }
         //insert(label, new QDoubleSpinBox());
-        if (label && label[0]) openVerticalBox(label);
+        if (label && label[0]) { openVerticalBox(label); markControlBox(true); }
         QDoubleSpinBox* w = new QDoubleSpinBox();
         uiNumEntry* c = new uiNumEntry(this, zone, w, init, min, max, step);
         insert(label, w);
@@ -1660,15 +1888,8 @@ public:
         if (label && label[0]) openVerticalBox(label);
         QDoubleSpinBox* w = new QDoubleSpinBox();
         w->setAlignment(Qt::AlignHCenter);
-#if 1
-        w->setStyleSheet(
-                         "QDoubleSpinBox {"
-                         "border: 2px solid orange;"
-                         "border-radius: 5px;"
-                         "font-size: 8pt;"
-                         "}"
-                         );
-#endif
+        w->setObjectName("numDisplay");     // styled in Grey.qss
+        w->setKeyboardTracking(false);
         uiNumEntry* c = new uiNumEntry(this, zone, w, init, min, max, step);
         insert(label, w);
         w->setButtonSymbols(QAbstractSpinBox::NoButtons);
@@ -1689,6 +1910,7 @@ public:
     virtual void addVerticalKnob(const char* label, FAUSTFLOAT* zone, FAUSTFLOAT init, FAUSTFLOAT min, FAUSTFLOAT max, FAUSTFLOAT step)
     {
         openVerticalBox(label);
+        markControlBox(false);
         QDial* w = new QDial(); //qsynthKnob();
         uiSlider* c = new uiSlider(this, zone, w, init, min, max, step, getScale(zone));
         insert(label, w);
@@ -1699,8 +1921,8 @@ public:
         addNumDisplay(0, zone, init, min, max, step);
         
         // compute the size of the knob+display
-        int width = int(64 * pow(2, fGuiSize[zone]));
-        int height = int(100 * pow(2, fGuiSize[zone]));
+        int width = int(FQT_KNOB_WIDTH * pow(2, fGuiSize[zone]));
+        int height = int(FQT_KNOB_HEIGHT * pow(2, fGuiSize[zone]));
         fGroupStack.top()->setMinimumSize(width, height);
         fGroupStack.top()->setMaximumSize(width, height);
         
@@ -1712,6 +1934,7 @@ public:
     virtual void addHorizontalKnob(const char* label, FAUSTFLOAT* zone, FAUSTFLOAT init, FAUSTFLOAT min, FAUSTFLOAT max, FAUSTFLOAT step)
     {
         openHorizontalBox(label);
+        markControlBox(true);
         QDial* w = new QDial(); //new qsynthKnob();
         uiSlider* c = new uiSlider(this, zone, w, init, min, max, step, getScale(zone));
         insert(label, w);
@@ -1744,9 +1967,10 @@ public:
             return;
         }
         openVerticalBox(label);
+        markControlBox(false);
         QSlider* w = new QSlider(Qt::Vertical);
-        w->setMinimumHeight(160);
-        w->setMinimumWidth(34);
+        w->setMinimumHeight(FQT_SLIDER_LENGTH);
+        w->setMinimumWidth(FQT_SLIDER_THICK);
         //w->setTickPosition(QSlider::TicksBothSides);
         uiSlider* c = new uiSlider(this, zone, w, init, min, max, step, getScale(zone));
         insert(label, w);
@@ -1770,9 +1994,10 @@ public:
             return;
         }
         openHorizontalBox(label);
+        markControlBox(true);
         QSlider* w = new QSlider(Qt::Horizontal);
-        w->setMinimumHeight(34);
-        w->setMinimumWidth(160);
+        w->setMinimumHeight(FQT_SLIDER_THICK);
+        w->setMinimumWidth(FQT_SLIDER_LENGTH);
         //w->setTickPosition(QSlider::TicksBothSides);
         uiSlider* c = new uiSlider(this, zone, w, init, min, max, step, getScale(zone));
         insert(label, w);
@@ -1810,7 +2035,7 @@ public:
     virtual void addMenu(const char* label, FAUSTFLOAT* zone, FAUSTFLOAT init, FAUSTFLOAT min,
                          FAUSTFLOAT max, FAUSTFLOAT step, const char* mdescr)
     {
-        if (label && label[0]) openVerticalBox(label);
+        if (label && label[0]) { openVerticalBox(label); markControlBox(true); }
         uiMenu* w = new uiMenu(this, zone, label, init, min, max, step, mdescr, 0);
         insert(label, w);
         checkForTooltip(zone, w);
@@ -1827,8 +2052,9 @@ public:
     virtual void addHorizontalBargraph(const char* label, FAUSTFLOAT* zone, FAUSTFLOAT min, FAUSTFLOAT max)
     {
         openVerticalBox(label);
+        markControlBox(true);
         if (isNumerical(zone)) {
-            addNumDisplay(0, zone, min, min, max, (max-min)/pow(10, FLT_DIG));
+            addNumDisplay(0, zone, min, min, max, displayStep(min, max));
         } else {
             AbstractDisplay* bargraph;
             bool db = (fUnit[zone] == "dB");
@@ -1857,8 +2083,9 @@ public:
     virtual void addVerticalBargraph(const char* label, FAUSTFLOAT* zone, FAUSTFLOAT min, FAUSTFLOAT max)
     {
         openVerticalBox(label);
+        markControlBox(isNumerical(zone));
         if (isNumerical(zone)) {
-            addNumDisplay(0, zone, min, min, max, (max-min)/pow(10, FLT_DIG));
+            addNumDisplay(0, zone, min, min, max, displayStep(min, max));
         } else {
             AbstractDisplay* bargraph;
             bool db = (fUnit[zone] == "dB");
@@ -1877,7 +2104,7 @@ public:
             }
             new uiBargraph(this, zone, bargraph, min, max);
             insert(label, bargraph);
-            addNumDisplay(0, zone, min, min, max, (max-min)/1000.0);
+            addNumDisplay(0, zone, min, min, max, displayStep(min, max));
             checkForTooltip(zone, bargraph);
         }
         closeBox();

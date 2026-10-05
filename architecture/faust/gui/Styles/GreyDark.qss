@@ -1,29 +1,29 @@
-/*  Faust QT light theme (Luca Spanedda)
+/*  Faust QT dark theme (Luca Spanedda)
  *
- *  Used by faust2caqt / faust2jaqt (loaded from Grey.qrc, compiled into each app).
+ *  Used by faust2caqt / faust2jaqt (GreyDark.qss is loaded from Grey.qrc, compiled into each app).
  *  Colors of knobs and bargraphs are painted in C++: see the THEME block at the
  *  top of faust/gui/QTUI.h and keep the two in sync.
  *
  *  Palette
- *    window      #f5f5f7     card        #ffffff     border   #d2d2d7
- *    text        #1d1d1f     text dim    #6e6e73     accent   #1d1d1f
- *    track       #e3e5e8
+ *    window      #1c1c1e     card        #2a2a2d     border   #3d3d42
+ *    text        #f2f2f4     text dim    #9a9aa0     accent   #f2f2f4
+ *    track       #3a3a3f
  */
 
 /* ---------- base ---------- */
 
 QMainWindow, QScrollArea, QScrollArea > QWidget > QWidget, QTGUI {
-    background-color: #f5f5f7;
+    background-color: #1c1c1e;
 }
 
 QWidget {
-    color: #1d1d1f;
+    color: #f2f2f4;
     font-size: 11px;
 }
 
 QToolTip {
-    background-color: #1d1d1f;
-    color: #ffffff;
+    background-color: #f2f2f4;
+    color: #1c1c1e;
     border: none;
     padding: 4px 6px;
 }
@@ -31,8 +31,8 @@ QToolTip {
 /* ---------- groups (hgroup / vgroup) ---------- */
 
 QGroupBox {
-    background-color: #ffffff;
-    border: 1px solid #d2d2d7;
+    background-color: #2a2a2d;
+    border: 1px solid #3d3d42;
     border-radius: 6px;
     margin-top: 14px;           /* room for the title */
     padding: 2px;
@@ -42,7 +42,7 @@ QGroupBox {
 /* groups inside groups: flat, so that nesting does not eat space */
 QGroupBox QGroupBox {
     background-color: transparent;
-    border: 1px solid #e6e6ea;
+    border: 1px solid #38383c;
     border-radius: 4px;
     font-weight: 500;
 }
@@ -59,11 +59,11 @@ QGroupBox::title {
     subcontrol-position: top left;
     left: 6px;
     padding: 0 3px;
-    color: #6e6e73;
+    color: #9a9aa0;
 }
 
 QGroupBox#topGroup::title {
-    color: #1d1d1f;
+    color: #f2f2f4;
 }
 
 /* box around a single control: only its caption, no frame */
@@ -78,14 +78,14 @@ QGroupBox#control, QGroupBox QGroupBox#control {
 QGroupBox#control::title {
     left: 2px;
     padding: 0;
-    color: #3a3a3c;
+    color: #d0d0d4;
 }
 
 /* ---------- pages (tgroup) ---------- */
 
 QTabWidget::pane {
-    background-color: #ffffff;
-    border: 1px solid #d2d2d7;
+    background-color: #2a2a2d;
+    border: 1px solid #3d3d42;
     border-radius: 6px;
     top: -1px;
 }
@@ -96,13 +96,13 @@ QTabWidget::tab-bar {
 }
 
 QWidget#tabPage {
-    background-color: #ffffff;
+    background-color: #2a2a2d;
 }
 
 QTabBar::tab {
-    background-color: #e8e8ed;
-    color: #3a3a3c;
-    border: 1px solid #d2d2d7;
+    background-color: #232326;
+    color: #d0d0d4;
+    border: 1px solid #3d3d42;
     border-bottom: none;
     border-top-left-radius: 5px;
     border-top-right-radius: 5px;
@@ -112,12 +112,12 @@ QTabBar::tab {
 }
 
 QTabBar::tab:hover {
-    background-color: #f0f0f4;
+    background-color: #303034;
 }
 
 QTabBar::tab:selected {
-    background-color: #ffffff;
-    color: #1d1d1f;
+    background-color: #2a2a2d;
+    color: #f2f2f4;
     font-weight: 600;
 }
 
@@ -125,17 +125,17 @@ QTabBar::tab:selected {
 
 QSlider::groove:horizontal {
     height: 4px;
-    background: #e3e5e8;
+    background: #3a3a3f;
     border-radius: 2px;
 }
 
 QSlider::sub-page:horizontal {     /* left part = value */
-    background: #1d1d1f;
+    background: #f2f2f4;
     border-radius: 2px;
 }
 
 QSlider::add-page:horizontal {
-    background: #e3e5e8;
+    background: #3a3a3f;
     border-radius: 2px;
 }
 
@@ -143,23 +143,23 @@ QSlider::handle:horizontal {
     width: 14px;
     margin: -6px 0;
     border-radius: 7px;
-    background: #ffffff;
-    border: 1px solid #b0b0b8;
+    background: #2a2a2d;
+    border: 1px solid #5a5a60;
 }
 
 QSlider::groove:vertical {
     width: 4px;
-    background: #e3e5e8;
+    background: #3a3a3f;
     border-radius: 2px;
 }
 
 QSlider::add-page:vertical {       /* bottom part = value */
-    background: #1d1d1f;
+    background: #f2f2f4;
     border-radius: 2px;
 }
 
 QSlider::sub-page:vertical {
-    background: #e3e5e8;
+    background: #3a3a3f;
     border-radius: 2px;
 }
 
@@ -167,12 +167,12 @@ QSlider::handle:vertical {
     height: 14px;
     margin: 0 -6px;
     border-radius: 7px;
-    background: #ffffff;
-    border: 1px solid #b0b0b8;
+    background: #2a2a2d;
+    border: 1px solid #5a5a60;
 }
 
 QSlider::handle:hover, QSlider::handle:focus {
-    border: 1px solid #1d1d1f;
+    border: 1px solid #f2f2f4;
 }
 
 /* ---------- numbers (value under sliders/knobs, numerical bargraphs) ---------- */
@@ -180,7 +180,7 @@ QSlider::handle:hover, QSlider::handle:focus {
 QDoubleSpinBox#numDisplay {
     background-color: transparent;
     border: none;
-    color: #3a3a3c;
+    color: #d0d0d4;
     font-size: 10px;
     padding: 0;
     min-width: 52px;
@@ -188,35 +188,35 @@ QDoubleSpinBox#numDisplay {
 
 /* nentry */
 QDoubleSpinBox {
-    background-color: #ffffff;
-    border: 1px solid #d2d2d7;
+    background-color: #2a2a2d;
+    border: 1px solid #3d3d42;
     border-radius: 4px;
     padding: 1px 2px;
-    selection-background-color: #1d1d1f;
+    selection-background-color: #f2f2f4;
 }
 
 QDoubleSpinBox:focus {
-    border: 1px solid #1d1d1f;
+    border: 1px solid #f2f2f4;
 }
 
 /* ---------- buttons, checkboxes, menus, radio ---------- */
 
 QPushButton {
-    background-color: #ffffff;
-    border: 1px solid #c7c7cc;
+    background-color: #2a2a2d;
+    border: 1px solid #4a4a50;
     border-radius: 5px;
     padding: 3px 10px;
     min-width: 40px;
 }
 
 QPushButton:hover {
-    border-color: #1d1d1f;
+    border-color: #f2f2f4;
 }
 
 QPushButton:pressed {
-    background-color: #1d1d1f;
-    border-color: #1d1d1f;
-    color: #ffffff;
+    background-color: #f2f2f4;
+    border-color: #f2f2f4;
+    color: #2a2a2d;
 }
 
 QCheckBox, QRadioButton {
@@ -227,27 +227,27 @@ QCheckBox, QRadioButton {
 QCheckBox::indicator, QRadioButton::indicator {
     width: 13px;
     height: 13px;
-    background: #ffffff;
-    border: 1px solid #b0b0b8;
+    background: #2a2a2d;
+    border: 1px solid #5a5a60;
 }
 
 QCheckBox::indicator { border-radius: 3px; }
 QRadioButton::indicator { border-radius: 7px; }
 
 QCheckBox::indicator:checked, QRadioButton::indicator:checked {
-    background: #1d1d1f;
-    border-color: #1d1d1f;
+    background: #f2f2f4;
+    border-color: #f2f2f4;
 }
 
 QComboBox {
-    background-color: #ffffff;
-    border: 1px solid #c7c7cc;
+    background-color: #2a2a2d;
+    border: 1px solid #4a4a50;
     border-radius: 4px;
     padding: 1px 6px;
 }
 
 QComboBox:hover {
-    border-color: #1d1d1f;
+    border-color: #f2f2f4;
 }
 
 /* ---------- scrollbars (only when the interface is larger than the screen) ---------- */
@@ -262,7 +262,7 @@ QScrollBar:vertical { width: 10px; }
 QScrollBar:horizontal { height: 10px; }
 
 QScrollBar::handle {
-    background: #c7c7cc;
+    background: #4a4a50;
     border-radius: 4px;
     margin: 2px;
 }
@@ -271,7 +271,7 @@ QScrollBar::handle:vertical { min-height: 30px; }
 QScrollBar::handle:horizontal { min-width: 30px; }
 
 QScrollBar::handle:hover {
-    background: #8e8e93;
+    background: #7a7a80;
 }
 
 QScrollBar::add-line, QScrollBar::sub-line,
@@ -284,14 +284,14 @@ QScrollBar::add-page, QScrollBar::sub-page {
 /* ---------- theme button (top right corner) ---------- */
 
 QToolButton#themeButton {
-    background-color: #ffffff;
-    color: #3a3a3c;
-    border: 1px solid #d2d2d7;
+    background-color: #2a2a2d;
+    color: #d0d0d4;
+    border: 1px solid #4a4a50;
     border-radius: 11px;
     font-size: 13px;
     padding: 0;
 }
 
 QToolButton#themeButton:hover {
-    border-color: #3a3a3c;
+    border-color: #d0d0d4;
 }
