@@ -1,117 +1,120 @@
-QPushButton{
-min-width : 80px;
-border: 2px solid grey;
-border-radius: 6px;
-margin-top: 1ex;
-border-color: #811453;
-background-color: transparent;
+QPushButton {
+    background-color: #000000; /* Mantieni il fondo nero per i pulsanti */
+    min-width: 80px;
+    border: 1px solid white;
+    margin-top: 1ex;
+    color: white;
 }
 
-QPushButton:hover{
-border: 2px;
-border-radius: 6px;
-border-color: #811453;
-background-color: #6A455D;
+QPushButton:hover {
+    border: 2px solid white;
 }
 
-QPushButton:pressed{
-background-color: #6A455D;
-border-radius: 6px;
-border-color: #811453;
+QPushButton:pressed {
+    border: 3px solid white;
 }
 
-QGroupBox{
-subcontrol: .QGroupBox;
-margin-top: 3ex;
-font-size: 10pt;
-font-weight: bold;
-color: black;
+QGroupBox {
+    background-color: #D3D3D3; /* Cambiato il colore a grigio chiaro */
+    margin-top: 3ex;
+    border-radius: 5px;
+    font-size: 10pt;
+    font-weight: bold;
+    color: black; /* Testo nero per contrasto */
 }
 
 QGroupBox::title {
-subcontrol-origin: margin;
-subcontrol-position: top center;
-padding: 0 5px;
-color: black;
+    subcontrol-origin: margin;
+    subcontrol-position: top center;
+    padding: 0 5px;
+    color: black; /* Cambiato in nero */
 }
 
-QMainWindow {
-margin-top: 3ex;
-font-size:10pt;
-font-weight:bold;
-color: black;
+QMainWindow, QDialog {
+    background-color: #FFFFFF; /* Modifica il background in bianco */
+    border-radius: 5px;
+    margin-top: 3ex;
+    font-size: 10pt;
+    font-weight: bold;
+    color: black; /* Testo nero per contrasto */
 }
 
-QPlainTextEdit, QTextEdit{
-background-color: transparent;
-border: 2px solid gray;
-border-radius: 5px;
-top: 3px;
-margin-top: 3ex;
-font-size:12pt;
-font-weight:bold;
-color: black;
+QPlainTextEdit, QTextEdit {
+    background-color: #FFFFFF; /* Sfondo bianco per i campi di testo */
+    border-color: white;
+    border-radius: 5px;
+    top: 3px;
+    margin-top: 3ex;
+    font-size: 12pt;
+    font-weight: bold;
+    color: black; /* Testo nero per contrasto */
 }
 
 QTextBrowser {
-color: black;
-}
-QTextBrowser:document{
-text-decoration: underline;
-color: black;
-font: Menlo;
-font-size: 14px
-}
-
-QLabel{
-color : black;
-background: transparent;
+    background-color: #FFFFFF; /* Sfondo bianco per il text browser */
+    color: black; /* Testo nero */
 }
 
 QSlider::groove:vertical {
-background: red;
-position: absolute; 
-left: 13px; right: 13px;
+    background: #E0E0E0; /* Grigio chiaro per lo slider */
+    position: absolute;
+    left: 13px; right: 13px;
 }
 
 QSlider::handle:vertical {
-height: 40px;
-width: 30px;
-background: qlineargradient(x1: 0, y1: 0, x2: 0, y2: 1, stop: 0 #E67E30, stop : 0.05 #AD4F09, stop: 0.3 #E67E30, stop : 0.90 #AD4F09, stop: 0.91 #AD4F09);
-margin: 0 -5px;
-border-radius: 5px;
+    height: 40px;
+    width: 30px;
+    background: qlineargradient(x1: 0, y1: 0, x2: 0, y2: 1, stop: 0 #AAAAAA, stop: 0.05 #0A0A0A, stop: 0.3 #101010, stop: 0.90 #AAAAAA, stop: 0.91 #000000);
+    margin: 0 -5px;
+    border-radius: 5px;
 }
 
 QSlider::add-page:vertical {
-background: qlineargradient(x1: 0, y1: 0, x2: 1, y2: 0,
-stop: 0 #6A455D, stop : 0.5 #6A455D);
+    background: qlineargradient(x1: 0, y1: 0, x2: 1, y2: 0, stop: 0 white, stop: 0.5 white);
 }
 
 QSlider::sub-page:vertical {
-background: grey;
+    background: grey;
 }
 
-QSlider::groove:horizontal {
-background: red;
-position: absolute;
-top: 14px; bottom: 14px;
+QTabWidget::pane {
+    background-color: #FFFFFF; /* Cambiato il fondo a bianco */
 }
 
-QSlider::handle:horizontal {
-width: 40px;
-background: qlineargradient(x1: 0, y1: 0, x2: 1, y2: 0, stop: 0 #E67E30, stop : 0.05 #AD4F09, stop: 0.3 #E67E30, stop : 0.90 #AD4F09, stop: 0.91 #AD4F09);
-margin: -5px 0;
-border-radius: 5px;
+QTabBar::tab {
+    background: #F1F1F1; /* Grigio molto chiaro per i tab */
+    border: 2px solid #000000;
+    border-bottom-color: white;
+    min-width: 8ex;
+    padding: 5px;
 }
 
-QSlider::sub-page:horizontal {
-background: qlineargradient(x1: 0, y1: 0, x2: 0, y2: 1, stop: 0 #6A455D, stop : 0.5 #6A455D);
+QTabBar::tab:selected, QTabBar::tab:hover {
+    background: #F1F1F1; /* Sfondo chiaro per il tab selezionato */
+    border-color: white;
+    border: 2px;
 }
 
-QSlider::add-page:horizontal {
-background: grey;
+QListWidget {
+    background-color: transparent;
 }
 
-QListWidget{
-background-color: transparent;
+QStatusBar {
+    background-color: transparent;
+    border: 0px;
+    padding: 0px 0px 0px 0px;
+    margin: 0px;
 }
+
+QScrollArea > QWidget > QWidget {
+    background-color: #FFFFFF; /* Sfondo bianco per le aree scrollabili */
+}
+
+QScrollArea > QWidget {
+    background-color: #FFFFFF; /* Sfondo bianco per le aree scrollabili */
+}
+
+QScrollArea {
+    background-color: #FFFFFF; /* Sfondo bianco per la scroll area */
+}
+

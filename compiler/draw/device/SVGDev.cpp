@@ -98,27 +98,24 @@ SVGDev::SVGDev(const char* ficName, double largeur, double hauteur)
     // viewBox:
     if (gGlobal->gScaledSVG) {
         fprintf(fic_repr,
-                "<svg xmlns=\"http://www.w3.org/2000/svg\" "
-                "xmlns:xlink=\"http://www.w3.org/1999/xlink\" viewBox=\"0 0 "
+                "<svg xmlns=\"http://www.w3.org/2000/svg\" xmlns:xlink=\"http://www.w3.org/1999/xlink\" viewBox=\"0 0 "
                 "%f %f\" width=\"100%%\" height=\"100%%\" version=\"1.1\">\n",
                 largeur, hauteur);
     } else {
         fprintf(fic_repr,
-                "<svg xmlns=\"http://www.w3.org/2000/svg\" "
-                "xmlns:xlink=\"http://www.w3.org/1999/xlink\" viewBox=\"0 0 "
+                "<svg xmlns=\"http://www.w3.org/2000/svg\" xmlns:xlink=\"http://www.w3.org/1999/xlink\" viewBox=\"0 0 "
                 "%f %f\" width=\"%fmm\" height=\"%fmm\" version=\"1.1\">\n",
                 largeur, hauteur, largeur * gScale, hauteur * gScale);
     }
 
     if (gGlobal->gShadowBlur) {
-        fprintf(
-            fic_repr,
-            "<defs>\n"
-            "   <filter id=\"filter\" filterRes=\"18\" x=\"0\" y=\"0\">\n"
-            "     <feGaussianBlur in=\"SourceGraphic\" stdDeviation=\"1.55\" result=\"blur\"/>\n"
-            "     <feOffset in=\"blur\" dx=\"3\" dy=\"3\"/>\n"
-            "   </filter>\n"
-            "</defs>\n");
+        fprintf(fic_repr,
+                "<defs>\n"
+                "   <filter id=\"filter\" filterRes=\"18\" x=\"0\" y=\"0\">\n"
+                "     <feGaussianBlur in=\"SourceGraphic\" stdDeviation=\"1.55\" result=\"blur\"/>\n"
+                "     <feOffset in=\"blur\" dx=\"3\" dy=\"3\"/>\n"
+                "   </filter>\n"
+                "</defs>\n");
     }
 }
 
@@ -136,23 +133,22 @@ void SVGDev::rect(double x, double y, double l, double h, const char* color, con
         fprintf(fic_repr, "<a xlink:href=\"%s\">\n", xmlcode(link, buf));
     }
     // draw the shadow
-    if (gGlobal->gShadowBlur) {
-        fprintf(fic_repr,
-                "<rect x=\"%f\" y=\"%f\" width=\"%f\" height=\"%f\" rx=\"0.1\" ry=\"0.1\" "
-                "style=\"stroke:none;fill:#aaaaaa;;filter:url(#filter);\"/>\n",
-                x + 1, y + 1, l, h);
-    } else {
-        fprintf(fic_repr,
-                "<rect x=\"%f\" y=\"%f\" width=\"%f\" height=\"%f\" rx=\"0\" ry=\"0\" "
-                "style=\"stroke:none;fill:#cccccc;\"/>\n",
-                x + 1, y + 1, l, h);
-    }
+    // if (gGlobal->gShadowBlur) {
+    //     fprintf(fic_repr,
+    //             "<rect x=\"%f\" y=\"%f\" width=\"%f\" height=\"%f\" rx=\"0.1\" ry=\"0.1\" "
+    //             "style=\"stroke:none;fill:#aaaaaa;;filter:url(#filter);\"/>\n",
+    //             x + 1, y + 1, l, h);
+    // } else {
+    //     fprintf(fic_repr,
+    //             "<rect x=\"%f\" y=\"%f\" width=\"%f\" height=\"%f\" rx=\"0\" ry=\"0\" "
+    //             "style=\"stroke:none;fill:#cccccc;\"/>\n",
+    //             x + 1, y + 1, l, h);
+    // }
 
     // draw the rectangle
     fprintf(fic_repr,
-            "<rect x=\"%f\" y=\"%f\" width=\"%f\" height=\"%f\" rx=\"0\" ry=\"0\" "
-            "style=\"stroke:none;fill:%s;\"/>\n",
-            x, y, l, h, color);
+            "<rect x=\"%f\" y=\"%f\" width=\"%f\" height=\"%f\" rx=\"0\" ry=\"0\" style=\"stroke:#000000;fill:#FFFFFF;\"/>\n",
+            x, y, l, h);//, color);
     if (link != 0 && link[0] != 0) {
         // close the optional link tag
         fprintf(fic_repr, "</a>\n");
@@ -163,8 +159,7 @@ void SVGDev::rect(double x, double y, double l, double h, const char* color, con
 //    points="350,180 380,180 380,160 410,160 410,180 440,180 440,140 470,140 470,180
 //    500,180 500,120 530,120 530,180" />
 
-void SVGDev::triangle(double x, double y, double l, double h, const char* color, const char* link,
-                      bool leftright)
+void SVGDev::triangle(double x, double y, double l, double h, const char* color, const char* link, bool leftright)
 {
     char buf[512];
     if (link != 0 && link[0] != 0) {
@@ -183,13 +178,9 @@ void SVGDev::triangle(double x, double y, double l, double h, const char* color,
         x1 = (float)(x + 2 * r);
         x2 = (float)(x + r);
     }
-    fprintf(fic_repr,
-            "<polygon fill=\"%s\" stroke=\"black\" stroke-width=\".25\" points=\"%f,%f %f,%f "
-            "%f,%f\"/>\n",
+    fprintf(fic_repr, "<polygon fill=\"%s\" stroke=\"black\" stroke-width=\".25\" points=\"%f,%f %f,%f %f,%f\"/>\n",
             color, x0, y, x1, y + h / 2.0, x0, y + h);
-    fprintf(fic_repr,
-            "<circle  fill=\"%s\" stroke=\"black\" stroke-width=\".25\" cx=\"%f\" cy=\"%f\" "
-            "r=\"%f\"/>\n",
+    fprintf(fic_repr, "<circle  fill=\"%s\" stroke=\"black\" stroke-width=\".25\" cx=\"%f\" cy=\"%f\" r=\"%f\"/>\n",
             color, x2, y + h / 2.0, r);
 }
 
@@ -205,25 +196,21 @@ void SVGDev::fleche(double x, double y, double rotation, int sens)
 
     if (sens == 1) {
         fprintf(fic_repr,
-                "<line x1=\"%f\" y1=\"%f\" x2=\"%f\" y2=\"%f\"  transform=\"rotate(%f,%f,%f)\" "
-                "style=\"stroke: black; "
+                "<line x1=\"%f\" y1=\"%f\" x2=\"%f\" y2=\"%f\"  transform=\"rotate(%f,%f,%f)\" style=\"stroke: black; "
                 "stroke-width:0.25;\"/>\n",
                 x - dx, y - dy, x, y, rotation, x, y);
         fprintf(fic_repr,
-                "<line x1=\"%f\" y1=\"%f\" x2=\"%f\" y2=\"%f\"  transform=\"rotate(%f,%f,%f)\" "
-                "style=\"stroke: black; "
+                "<line x1=\"%f\" y1=\"%f\" x2=\"%f\" y2=\"%f\"  transform=\"rotate(%f,%f,%f)\" style=\"stroke: black; "
                 "stroke-width:0.25;\"/>\n",
                 x - dx, y + dy, x, y, rotation, x, y);
     } else  // for recursion
     {
         fprintf(fic_repr,
-                "<line x1=\"%f\" y1=\"%f\" x2=\"%f\" y2=\"%f\"  transform=\"rotate(%f,%f,%f)\" "
-                "style=\"stroke: black; "
+                "<line x1=\"%f\" y1=\"%f\" x2=\"%f\" y2=\"%f\"  transform=\"rotate(%f,%f,%f)\" style=\"stroke: black; "
                 "stroke-width:0.25;\"/>\n",
                 x + dx, y - dy, x, y, rotation, x, y);
         fprintf(fic_repr,
-                "<line x1=\"%f\" y1=\"%f\" x2=\"%f\" y2=\"%f\"  transform=\"rotate(%f,%f,%f)\" "
-                "style=\"stroke: black; "
+                "<line x1=\"%f\" y1=\"%f\" x2=\"%f\" y2=\"%f\"  transform=\"rotate(%f,%f,%f)\" style=\"stroke: black; "
                 "stroke-width:0.25;\"/>\n",
                 x + dx, y + dy, x, y, rotation, x, y);
     }
@@ -231,17 +218,16 @@ void SVGDev::fleche(double x, double y, double rotation, int sens)
 
 void SVGDev::carre(double x, double y, double cote)
 {
-    fprintf(fic_repr,
-            "<rect x=\"%f\" y=\"%f\" width=\"%f\" height=\"%f\" style=\"stroke: "
-            "black;stroke-width:0.5;fill:none;\"/>\n",
-            x - 0.5 * cote, y - cote, cote, cote);
+    fprintf(
+        fic_repr,
+        "<rect x=\"%f\" y=\"%f\" width=\"%f\" height=\"%f\" style=\"stroke: black;stroke-width:0.5;fill:none;\"/>\n",
+        x - 0.5 * cote, y - cote, cote, cote);
 }
 
 void SVGDev::trait(double x1, double y1, double x2, double y2)
 {
     fprintf(fic_repr,
-            "<line x1=\"%f\" y1=\"%f\" x2=\"%f\" y2=\"%f\"  style=\"stroke:black; "
-            "stroke-linecap:round; "
+            "<line x1=\"%f\" y1=\"%f\" x2=\"%f\" y2=\"%f\"  style=\"stroke:black; stroke-linecap:round; "
             "stroke-width:0.25;\"/>\n",
             x1, y1, x2, y2);
 }
@@ -249,8 +235,7 @@ void SVGDev::trait(double x1, double y1, double x2, double y2)
 void SVGDev::dasharray(double x1, double y1, double x2, double y2)
 {
     fprintf(fic_repr,
-            "<line x1=\"%f\" y1=\"%f\" x2=\"%f\" y2=\"%f\"  style=\"stroke: black; "
-            "stroke-linecap:round; "
+            "<line x1=\"%f\" y1=\"%f\" x2=\"%f\" y2=\"%f\"  style=\"stroke: black; stroke-linecap:round; "
             "stroke-width:0.25; stroke-dasharray:3,3;\"/>\n",
             x1, y1, x2, y2);
 }
@@ -264,8 +249,8 @@ void SVGDev::text(double x, double y, const char* name, const char* link)
     }
     char name2[256];
     fprintf(fic_repr,
-            "<text x=\"%f\" y=\"%f\" font-family=\"Arial\" font-size=\"7\" text-anchor=\"middle\" "
-            "fill=\"#FFFFFF\">%s</text>\n",
+            "<text x=\"%f\" y=\"%f\" font-family=\"Verdana\" font-size=\"7\" text-anchor=\"middle\" "
+            "fill=\"#000000\">%s</text>\n",
             x, y + 2, xmlcode(name, name2));
     if (link != 0 && link[0] != 0) {
         // close the optional link tag
@@ -276,8 +261,8 @@ void SVGDev::text(double x, double y, const char* name, const char* link)
 void SVGDev::label(double x, double y, const char* name)
 {
     char name2[256];
-    fprintf(fic_repr, "<text x=\"%f\" y=\"%f\" font-family=\"Arial\" font-size=\"7\">%s</text>\n",
-            x, y + 2, xmlcode(name, name2));
+    fprintf(fic_repr, "<text x=\"%f\" y=\"%f\" font-family=\"Verdana\" font-size=\"7\">%s</text>\n", x, y + 2,
+            xmlcode(name, name2));
 }
 
 void SVGDev::markSens(double x, double y, int sens)
@@ -286,17 +271,14 @@ void SVGDev::markSens(double x, double y, int sens)
     fprintf(fic_repr, "<circle cx=\"%f\" cy=\"%f\" r=\"1\"/>\n", x + offset, y + offset);
 }
 
-void SVGDev::Error(const char* message, const char* reason, int nb_error, double x, double y,
-                   double largeur)
+void SVGDev::Error(const char* message, const char* reason, int nb_error, double x, double y, double largeur)
 {
     fprintf(fic_repr,
-            "<text x=\"%f\" y=\"%f\"  textLength=\"%f\" lengthAdjust=\"spacingAndGlyphs\" "
-            "style=\"stroke: red; "
+            "<text x=\"%f\" y=\"%f\"  textLength=\"%f\" lengthAdjust=\"spacingAndGlyphs\" style=\"stroke: red; "
             "stroke-width:0.3; fill:red; text-anchor:middle;\">%d : %s</text>\n",
             x, y - 7, largeur, nb_error, message);
     fprintf(fic_repr,
-            "<text x=\"%f\" y=\"%f\"  textLength=\"%f\" lengthAdjust=\"spacingAndGlyphs\" "
-            "style=\"stroke: red; "
+            "<text x=\"%f\" y=\"%f\"  textLength=\"%f\" lengthAdjust=\"spacingAndGlyphs\" style=\"stroke: red; "
             "stroke-width:0.3; fill:none; text-anchor:middle;\">%s</text>\n",
             x, y + 7, largeur, reason);
 }
