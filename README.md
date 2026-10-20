@@ -27,6 +27,24 @@ The original README is in the upstream repository.
 
 Usual build: `faust2caqt -double -midi -resample -preset auto file.dsp`
 
+- **`faust2caqt-meters`** (`tools/faust2appls/faust2caqt-meters`, `architecture/ca-qt-meters.cpp`,
+  `architecture/faust/gui/QTMeters.h`): same as `faust2caqt` (same options), plus an analysis strip
+  above the controls, modelled on MiniMeters, drawn by the GPU at 60 fps with the colors of the
+  light/dark theme:
+  - waveform, levels (peak, RMS Fast/Slow, LUFS Momentary/Short-Term), stereometer with
+    correlation, oscilloscope (Follow Pitch, Single/Multi cycle), spectrum (two curves, readout of
+    the loudest frequency with note and cents; FFT size follows the sample rate);
+  - everything shows two signals, L and R: a routing matrix (round button, top left) sends any
+    input or output of the DSP to L and/or R; several channels on a side are averaged;
+  - right click on a module: display options (Left/Right or Mid/Side, level mode, FFT size...);
+  - the divider below the strip resizes or closes it, the round button next to the theme button
+    closes/reopens it; when closed it costs almost nothing;
+  - when the window is smaller than the interface, the controls are scaled down proportionally;
+  - routing and options are saved per application.
+
+  The audio thread only copies the buffers (lock-free ring): the DSP is unchanged.
+  Usual build: `faust2caqt-meters -double -midi -resample -preset auto file.dsp`
+
 ## Install (macOS)
 
 ```bash
