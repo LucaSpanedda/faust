@@ -1,7 +1,8 @@
 /************************** BEGIN QTMeters.h **************************
  Analysis strip for the Faust QT applications (Luca Spanedda), modelled on
- MiniMeters: waveform, levels/loudness, stereometer, oscilloscope and spectrum,
- above the controls of the QTGUI window.
+ MiniMeters: waveform flowing into the oscilloscope, levels/loudness,
+ stereometer and spectrum (or spectrogram), above the controls of the QTGUI
+ window, and a status bar below them (CPU per core, DSP load, block size).
 
  Everything shows two signals, L and R. A routing matrix (round button in the
  top left corner of the strip) decides which inputs and outputs of the DSP
@@ -28,6 +29,8 @@
 #define __QTMeters__
 
 #include <atomic>
+#include <chrono>
+#include <climits>
 #include <complex>
 #include <deque>
 #include <functional>
@@ -44,6 +47,7 @@
 #include <QOpenGLWidget>
 #include <QSurfaceFormat>
 #endif
+#include <QImage>
 #include <QPainter>
 #include <QPainterPath>
 #include <QScrollArea>
@@ -54,6 +58,12 @@
 #include <QVBoxLayout>
 
 #include "faust/dsp/dsp.h"
+
+#ifdef __APPLE__
+#include <CoreAudio/CoreAudio.h>
+#include <mach/mach.h>
+#include <sys/resource.h>
+#endif
 
 //==============================RING BUFFER=====================================
 
@@ -109,6 +119,36 @@ class MeterRing
 };
 
 /**
+ * What the audio thread measures for the status bar: the block size actually
+ * asked by the driver (CoreAudio never tells it otherwise) and the time spent
+ * in the DSP compute, compared with the duration of the block (DSP load).
+ * Atomics only; the GUI thread reads and resets the per-period values.
+ */
+struct MeterTiming
+{
+    std::atomic<int> fBlock{0};                 // last block size
+    std::atomic<int> fBlockMin{INT_MAX};        // since the last read
+    std::atomic<int> fBlockMax{0};
+    std::atomic<uint64_t> fBusyNs{0};           // total time in the DSP compute
+    std::atomic<uint64_t> fSamples{0};          // total samples computed
+    std::atomic<uint64_t> fWorst{0};            // worst block since the last read, ns per 1024 samples
+    std::atomic<uint64_t> fLate{0};             // blocks computed in more time than their duration
+    int fSampleRate = 0;
+
+    void record(int count, uint64_t ns)
+    {
+        fBlock.store(count, std::memory_order_relaxed);
+        if (count < fBlockMin.load(std::memory_order_relaxed)) fBlockMin.store(count, std::memory_order_relaxed);
+        if (count > fBlockMax.load(std::memory_order_relaxed)) fBlockMax.store(count, std::memory_order_relaxed);
+        fBusyNs.fetch_add(ns, std::memory_order_relaxed);
+        fSamples.fetch_add(uint64_t(count), std::memory_order_relaxed);
+        uint64_t perK = count > 0 ? ns * 1024 / uint64_t(count) : 0;
+        if (perK > fWorst.load(std::memory_order_relaxed)) fWorst.store(perK, std::memory_order_relaxed);
+        if (fSampleRate > 0 && ns * uint64_t(fSampleRate) > uint64_t(count) * 1000000000ull) fLate.fetch_add(1, std::memory_order_relaxed);
+    }
+};
+
+/**
  * DSP decorator feeding the rings. The wrapped DSP is not owned: it is
  * deleted by the architecture file as usual.
  */
@@ -119,6 +159,7 @@ class MeterDSP : public decorator_dsp
 
         MeterRing fIn;
         MeterRing fOut;
+        MeterTiming fTiming;
 
     public:
 
@@ -127,12 +168,22 @@ class MeterDSP : public decorator_dsp
 
         MeterRing& inputs() { return fIn; }
         MeterRing& outputs() { return fOut; }
+        MeterTiming& timing() { return fTiming; }
+
+        virtual void init(int sample_rate)
+        {
+            fTiming.fSampleRate = sample_rate;
+            decorator_dsp::init(sample_rate);
+        }
 
         virtual void compute(int count, FAUSTFLOAT** inputs, FAUSTFLOAT** outputs)
         {
             fIn.push(inputs, count);        // before compute: inputs may be reused in place
+            auto t0 = std::chrono::steady_clock::now();
             fDSP->compute(count, inputs, outputs);
+            auto t1 = std::chrono::steady_clock::now();
             fOut.push(outputs, count);
+            fTiming.record(count, uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count()));
         }
 
         virtual void compute(double /*date_usec*/, int count, FAUSTFLOAT** inputs, FAUSTFLOAT** outputs)
@@ -277,6 +328,9 @@ static const int kMeterFrameMs = 16;    // 60 fps
 /**
  * Base class of a module: background, options menu, update from the GUI
  * timer. Modules draw in paintGL() with a QPainter, on the GPU or the CPU.
+ * Mode chips: the main display modes of a module, shown as small segmented
+ * buttons at its top while the mouse is over it (nothing at rest); a click
+ * selects. The right click menu keeps all the options.
  */
 class MeterModule : public MeterSurface
 {
@@ -322,6 +376,52 @@ class MeterModule : public MeterSurface
 
         void paintBackground(QPainter& p) { p.fillRect(rect(), FQT_METER_BG); }
 
+        // mode chips: one group per option, bound to an int member like addChoice
+        struct ChipGroup { const char* name; int* member; QStringList labels; QList<int> values; };
+        struct Chip { QRectF rect; const char* name; int* member; int value; };
+        std::vector<Chip> fChips;
+        bool fHover = false;
+
+        virtual std::vector<ChipGroup> chipGroups() { return {}; }
+        virtual QPointF chipOrigin() const { return QPointF(6, 5); }
+
+        // called at the end of paintGL()
+        void paintChips(QPainter& p)
+        {
+            fChips.clear();
+            if (!fHover) return;
+            p.setRenderHint(QPainter::Antialiasing, true);
+            p.setFont(fqtMeterFont(8, false));
+            QFontMetricsF fm(p.font());
+            const float h = 16.f, pad = 7.f;
+            QPointF o = chipOrigin();
+            float x = float(o.x());
+            for (const ChipGroup& g : chipGroups()) {
+                float w = 2.f;
+                for (const QString& l : g.labels) w += float(fm.horizontalAdvance(l)) + 2 * pad;
+                QRectF box(x, o.y(), w, h);
+                p.setPen(QPen(FQT_BORDER, 1));
+                p.setBrush(FQT_METER_BG);
+                p.drawRoundedRect(box, h / 2, h / 2);
+                float sx = x + 1.f;
+                for (int i = 0; i < g.labels.size(); i++) {
+                    QRectF seg(sx, o.y(), float(fm.horizontalAdvance(g.labels[i])) + 2 * pad, h);
+                    bool on = (*g.member == g.values[i]);
+                    if (on) {
+                        p.setPen(Qt::NoPen);
+                        p.setBrush(FQT_ACCENT);
+                        p.drawRoundedRect(seg.adjusted(1.5, 1.5, -1.5, -1.5), (h - 3) / 2, (h - 3) / 2);
+                    }
+                    p.setPen(on ? FQT_METER_BG : FQT_TEXT);
+                    p.drawText(seg, Qt::AlignCenter, g.labels[i]);
+                    fChips.push_back({ seg, g.name, g.member, g.values[i] });
+                    sx = float(seg.right());
+                }
+                x = float(box.right()) + 6.f;
+            }
+            p.setBrush(Qt::NoBrush);
+        }
+
     public:
 
         MeterModule(const MeterSource& src, const QString& key) : fSource(src), fKey(key)
@@ -334,7 +434,24 @@ class MeterModule : public MeterSurface
             setFormat(f);
 #endif
             setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
-            setToolTip("Right click: options");
+            setToolTip("Right click: all options");
+        }
+
+        virtual void enterEvent(QEnterEvent*) { fHover = true; update(); }
+        virtual void leaveEvent(QEvent*) { fHover = false; update(); }
+
+        virtual void mousePressEvent(QMouseEvent* e)
+        {
+            if (e->button() != Qt::LeftButton) return;
+            for (const Chip& c : fChips) {
+                if (c.rect.contains(e->position())) {
+                    *c.member = c.value;
+                    setOption(c.name, c.value);
+                    optionsChanged();
+                    update();
+                    return;
+                }
+            }
         }
 
         virtual void tick() = 0;    // read the ring and analyse (GUI thread, once per frame)
@@ -352,97 +469,280 @@ class MeterModule : public MeterSurface
         }
 };
 
-//==============================WAVEFORM=====================================
+//==============================WAVEFORM + OSCILLOSCOPE==========================
 
 /**
- * Scrolling waveform of L and R (or Mid and Side) in two lanes, as in
- * MiniMeters: each column is the min/max of 10 ms by default, the newest on
- * the right.
+ * Scrolling waveform flowing into the oscilloscope, on a single time line:
+ * - on the left the history, each column is the min/max of 10 ms by default;
+ * - then a lens, where the time per pixel shrinks geometrically from the
+ *   duration of a column to the zoom of the scope: the envelope thins into
+ *   the signal itself;
+ * - on the right the oscilloscope, starting where the lens ends.
+ * With Follow Pitch the scope starts on a rising zero crossing of the first
+ * lane and shows one or four periods (as the former separate scope): the
+ * whole time line ends there (a few
+ * milliseconds behind "now"), so the three parts stay continuous and every
+ * trace passes through the junction. The older scope traces fade out
+ * (persistence, off by default), the newest one has a soft glow. Zoom
+ * (1:1 by default) scales the whole time line, history, lens and scope
+ * together, so that the louder visible part fills 90% of the lanes (shown
+ * as xN). Two lanes: L and R, or Mid and Side.
  */
-class WaveformModule : public MeterModule
+class WaveScopeModule : public MeterModule
 {
 
     private:
 
-        static const int kColumns = 2000;           // 20 s of history at 10 ms
-        struct Trace { std::deque<std::pair<float, float>> cols; float lo = 0.f, hi = 0.f; };
-        Trace fTraces[2];
+        static const int kColumns = 4000;           // history columns (wide windows at 10 ms)
+        static const int kWindow = 16384;           // samples searched by the trigger
+        static const int kMaxGhosts = 16;
+
+        struct Column { float lo, hi; };
+        struct Geometry { QRectF all; float xa, xj, scopeW; int lensW; };
+
+        // history
+        std::deque<Column> fCols[2];
+        float fLo[2] = { 0.f, 0.f }, fHi[2] = { 0.f, 0.f };
         int fCount = 0;
         int fVersion = -1;
-        uint64_t fRead = 0;
+        uint64_t fRead = 0;                         // next sample folded into the columns
+        uint64_t fColEnd = 0;                       // absolute end (excluded) of the newest column
+        int fPerColumn = 480;
+
+        // lens: min/max per pixel, from the junction leftwards
+        std::vector<Column> fLens[2];
+
+        // scope: start and length of the trace, older traces (u 0..1, v -1..1)
+        uint64_t fT0 = 0;
+        int fLen = 2048;
+        float fFreq = 0.f;
+        std::deque<std::vector<QPointF>> fTraces[2];
+
+        // options
         int fSpeed = 1;
         int fMidSide = 0;
-        std::vector<float> fIn[2];
+        int fFollow = 1;
+        int fCycles = 1;
+        int fPersistence = 0;
+        int fGlow = 1;
+        int fAutoGain = 0;
+        float fGain = 1.f;                          // zoom of the whole module (Zoom)
+
+        std::vector<float> fBuf[2];
         std::vector<QLineF> fLines;
+        std::vector<QPointF> fPoints;
 
         virtual void fillMenu(QMenu* menu)
         {
             addChoice(menu, "Display", "midside", fMidSide, { "Left / Right", "Mid / Side" }, { 0, 1 });
-            addChoice(menu, "Speed", "speed", fSpeed, { "Slow (40 ms / pixel)", "Normal (10 ms / pixel)", "Fast (2.5 ms / pixel)" }, { 0, 1, 2 });
+            addChoice(menu, "History", "speed", fSpeed, { "Slow (40 ms / pixel)", "Normal (10 ms / pixel)", "Fast (2.5 ms / pixel)" }, { 0, 1, 2 });
+            addChoice(menu, "Follow Pitch", "follow", fFollow, { "On", "Off" }, { 1, 0 });
+            addChoice(menu, "Cycle", "cycles", fCycles, { "Single", "Multi" }, { 1, 4 });
+            addChoice(menu, "Persistence", "persistence", fPersistence, { "Off", "Short", "Long" }, { 0, 6, kMaxGhosts });
+            addChoice(menu, "Glow", "glow", fGlow, { "On", "Off" }, { 1, 0 });
+            addChoice(menu, "Scale", "zoom", fAutoGain, { "1:1", "Zoom (on quiet signals)" }, { 0, 1 });
         }
 
         virtual void optionsChanged() { fVersion = -1; }   // restart the history
 
-        void paintTrace(QPainter& p, const Trace& t, const QRectF& all, float cy, float amp)
+        virtual std::vector<ChipGroup> chipGroups()
         {
-            int n = std::min(int(t.cols.size()), int(all.width()));
-            fLines.clear();
-            for (int i = 0; i < n; i++) {
-                const auto& c = t.cols[t.cols.size() - 1 - i];
-                float x = float(all.right()) - i;
-                float y0 = cy - std::min(1.f, std::max(-1.f, c.second)) * amp;
-                float y1 = cy - std::min(1.f, std::max(-1.f, c.first)) * amp;
-                fLines.emplace_back(x, y0, x, std::max(y1, y0 + 1));
+            return { { "midside", &fMidSide, { "L/R", "M/S" }, { 0, 1 } },
+                     { "zoom", &fAutoGain, { "1:1", "Zoom" }, { 0, 1 } } };
+        }
+
+        virtual QPointF chipOrigin() const { return QPointF(34, 8); }     // right of the routing button
+
+        Geometry geometry() const
+        {
+            Geometry g;
+            g.all = QRectF(rect()).adjusted(2, 30, -2, -4);     // below the routing button
+            float w = float(g.all.width());
+            g.scopeW = std::floor(w * 0.38f);
+            g.lensW = int(std::max(16.f, w * 0.16f));
+            g.xj = float(g.all.right()) - g.scopeW;
+            g.xa = g.xj - g.lensW;
+            return g;
+        }
+
+        // 'n' samples of both lanes (L/R or M/S) from absolute position 'start'
+        void readLanes(uint64_t start, int n)
+        {
+            for (int k = 0; k < 2; k++) {
+                fBuf[k].resize(std::max(n, 1));
+                fSource.readSide(k, start, fBuf[k].data(), n);
             }
-            p.setPen(QPen(FQT_ACCENT, 1));
-            p.drawLines(fLines.data(), int(fLines.size()));
+            if (fMidSide) {
+                for (int i = 0; i < n; i++) {
+                    float l = fBuf[0][i], r = fBuf[1][i];
+                    fBuf[0][i] = 0.5f * (l + r);
+                    fBuf[1][i] = 0.5f * (l - r);
+                }
+            }
+        }
+
+        // samples covered by the pixels of the lens: S[i] = samples between the junction and pixel i
+        std::vector<double> lensSpans(const Geometry& g) const
+        {
+            std::vector<double> s(g.lensW + 1, 0.0);
+            double scope = double(fLen) / std::max(1.f, g.scopeW);
+            double r = std::pow(std::max(1.0, fPerColumn / scope), 1.0 / g.lensW);
+            double step = scope;
+            for (int i = 0; i < g.lensW; i++) {
+                step *= r;
+                s[i + 1] = s[i] + step;
+            }
+            return s;
+        }
+
+        // trace of lane 'k' (fBuf, from 'offset'), at most two points per pixel
+        std::vector<QPointF> trace(int k, int offset, int pixels) const
+        {
+            std::vector<QPointF> pts;
+            const float* x = fBuf[k].data() + offset;
+            float gain = fGain;
+            auto v = [gain](float s) { return std::min(1.f, std::max(-1.f, s * gain)); };
+            if (fLen <= 2 * pixels) {
+                for (int i = 0; i < fLen; i++) pts.emplace_back(double(i) / (fLen - 1), v(x[i]));
+                return pts;
+            }
+            // min and max of each pixel, in the order they occur
+            for (int p = 0; p < pixels; p++) {
+                int i0 = int(int64_t(p) * fLen / pixels), i1 = std::max(i0 + 1, int(int64_t(p + 1) * fLen / pixels));
+                int imin = i0, imax = i0;
+                for (int i = i0; i < i1; i++) {
+                    if (x[i] < x[imin]) imin = i;
+                    if (x[i] > x[imax]) imax = i;
+                }
+                int a = std::min(imin, imax), b = std::max(imin, imax);
+                pts.emplace_back(double(a) / (fLen - 1), v(x[a]));
+                if (b != a) pts.emplace_back(double(b) / (fLen - 1), v(x[b]));
+            }
+            return pts;
+        }
+
+        void paintTrace(QPainter& p, const std::vector<QPointF>& t, const Geometry& g, float cy, float amp)
+        {
+            fPoints.clear();
+            for (const QPointF& pt : t) fPoints.emplace_back(g.xj + pt.x() * g.scopeW, cy - pt.y() * amp);
+            p.drawPolyline(fPoints.data(), int(fPoints.size()));
         }
 
     public:
 
-        WaveformModule(const MeterSource& src) : MeterModule(src, "waveform")
+        WaveScopeModule(const MeterSource& src) : MeterModule(src, "wavescope")
         {
-            setMinimumWidth(80);
+            setMinimumWidth(160);
             fSpeed = option("speed", 1);
             fMidSide = option("midside", 0);
+            fFollow = option("follow", 1);
+            fCycles = option("cycles", 1);
+            fPersistence = std::min(int(kMaxGhosts), std::max(0, option("persistence", 0)));
+            fGlow = option("glow", 1);
+            fAutoGain = option("zoom", 0);
         }
 
         virtual void tick()
         {
             uint64_t w = fSource.clock();
             static const int tenthsOfMs[] = { 400, 100, 25 };   // duration of a column
-            int perColumn = std::max(1, fSource.fSampleRate * tenthsOfMs[fSpeed] / 10000);
+            fPerColumn = std::max(1, fSource.fSampleRate * tenthsOfMs[fSpeed] / 10000);
             if (fVersion != fSource.fVersion) {
                 // new routing or options: restart the history
                 fVersion = fSource.fVersion;
-                fRead = w;
+                fRead = fColEnd = w;
                 fCount = 0;
-                for (Trace& t : fTraces) t = Trace();
+                for (int k = 0; k < 2; k++) { fCols[k].clear(); fTraces[k].clear(); }
             }
+
+            // history: fold the new samples into columns
             int n = int(std::min<uint64_t>(w - fRead, MeterRing::kSize / 2));
-            for (int k = 0; k < 2; k++) {
-                fIn[k].resize(std::max(n, 1));
-                fSource.readSide(k, w - n, fIn[k].data(), n);
-            }
+            uint64_t start = w - n;
+            readLanes(start, n);
             for (int i = 0; i < n; i++) {
-                float l = fIn[0][i], r = fIn[1][i];
-                float v[2] = { l, r };
-                if (fMidSide) { v[0] = 0.5f * (l + r); v[1] = 0.5f * (l - r); }
                 for (int k = 0; k < 2; k++) {
-                    Trace& t = fTraces[k];
-                    if (fCount == 0) t.lo = t.hi = v[k];
-                    t.lo = std::min(t.lo, v[k]);
-                    t.hi = std::max(t.hi, v[k]);
+                    float v = fBuf[k][i];
+                    if (fCount == 0) fLo[k] = fHi[k] = v;
+                    fLo[k] = std::min(fLo[k], v);
+                    fHi[k] = std::max(fHi[k], v);
                 }
-                if (++fCount == perColumn) {
-                    for (Trace& t : fTraces) {
-                        t.cols.emplace_back(t.lo, t.hi);
-                        if (int(t.cols.size()) > kColumns) t.cols.pop_front();
+                if (++fCount == fPerColumn) {
+                    for (int k = 0; k < 2; k++) {
+                        fCols[k].push_back({ fLo[k], fHi[k] });
+                        if (int(fCols[k].size()) > kColumns) fCols[k].pop_front();
                     }
+                    fColEnd = start + i + 1;
                     fCount = 0;
                 }
             }
             fRead = w;
+
+            // scope: rising zero crossings of the first lane with a small hysteresis, searched backwards
+            uint64_t winStart = w - kWindow;
+            readLanes(winStart, kWindow);
+            int len = 2048, s = kWindow - len;
+            fFreq = 0.f;
+            if (fFollow) {
+                std::vector<int> ups;
+                bool below = false;
+                const std::vector<float>& b = fBuf[0];
+                for (int i = kWindow - 1; i > 0 && int(ups.size()) <= fCycles + 1; i--) {
+                    if (b[i] < -1e-4f) below = true;
+                    if (below && b[i - 1] <= 0.f && b[i] > 0.f) { ups.push_back(i); below = false; }
+                }
+                if (int(ups.size()) > fCycles + 1) {
+                    int period = ups[0] - ups[1];
+                    len = std::min(std::max(fCycles * period, 32), kWindow / 2);
+                    s = ups[fCycles + 1];
+                    if (s + len > kWindow) s = kWindow - len;
+                    fFreq = float(fSource.fSampleRate) / std::max(1, period);
+                }
+            }
+            fT0 = winStart + s;
+            fLen = len;
+            // zoom: the louder visible part (scope and history) fills 90% of the lanes, at most x16;
+            // immediate when the signal grows, slow when it decays
+            Geometry g = geometry();
+            float target = 1.f;
+            if (fAutoGain) {
+                float pk = 0.f;
+                int visible = int(g.xa - g.all.left());
+                for (int k = 0; k < 2; k++) {
+                    for (int i = s; i < s + len; i++) pk = std::max(pk, std::fabs(fBuf[k][i]));
+                    const std::deque<Column>& cols = fCols[k];
+                    for (int i = std::max(0, int(cols.size()) - visible); i < int(cols.size()); i++)
+                        pk = std::max(pk, std::max(std::fabs(cols[i].lo), std::fabs(cols[i].hi)));
+                }
+                target = std::min(16.f, std::max(1.f, 0.9f / std::max(pk, 1e-6f)));
+            }
+            fGain = (target < fGain) ? target : fGain + (target - fGain) * 0.05f;
+            int pixels = std::max(2, int(g.scopeW));
+            for (int k = 0; k < 2; k++) {
+                fTraces[k].push_front(trace(k, s, pixels));
+                while (int(fTraces[k].size()) > fPersistence + 1) fTraces[k].pop_back();
+            }
+
+            // lens: pixel i covers [T0 - S[i+1], T0 - S[i]], the linearly interpolated signal is rasterized
+            std::vector<double> spans = lensSpans(g);
+            int lensSamples = int(std::ceil(spans[g.lensW])) + 2;
+            uint64_t lensStart = fT0 - uint64_t(lensSamples);
+            readLanes(lensStart, lensSamples + 2);
+            for (int k = 0; k < 2; k++) {
+                const std::vector<float>& b = fBuf[k];
+                auto at = [&](double t) {
+                    int i = std::max(0, std::min(int(t), lensSamples));
+                    float f = float(t - i);
+                    return b[i] * (1 - f) + b[i + 1] * f;
+                };
+                fLens[k].resize(g.lensW);
+                for (int i = 0; i < g.lensW; i++) {
+                    double t0 = lensSamples - spans[i + 1], t1 = lensSamples - spans[i];
+                    float va = at(t0), vb = at(t1);
+                    float lo = std::min(va, vb), hi = std::max(va, vb);
+                    for (int j = int(t0) + 1; j < t1; j++) { lo = std::min(lo, b[j]); hi = std::max(hi, b[j]); }
+                    fLens[k][i] = { lo, hi };
+                }
+            }
             update();
         }
 
@@ -450,17 +750,84 @@ class WaveformModule : public MeterModule
         {
             QPainter p(this);
             paintBackground(p);
-            QRectF all = QRectF(rect()).adjusted(2, 30, -2, -4);     // below the routing button
-            float lh = float(all.height()) / 2;
+            Geometry g = geometry();
+            float lh = float(g.all.height()) / 2;
             static const char* names[2][2] = { { "L", "R" }, { "M", "S" } };
-            p.setFont(fqtMeterFont(8));
+            std::vector<double> spans = lensSpans(g);
+            // newest history column that ends before the lens begins
+            int64_t lensBegin = int64_t(fT0) - int64_t(std::ceil(spans[g.lensW]));
+            int skip = int(std::max<int64_t>(0, (int64_t(fColEnd) - lensBegin + fPerColumn - 1) / fPerColumn));
+
             for (int k = 0; k < 2; k++) {
-                float cy = float(all.top()) + lh * (k + 0.5f), amp = lh * 0.45f;
-                p.fillRect(QRectF(all.left(), cy, all.width(), 1), FQT_TRACK);
-                paintTrace(p, fTraces[k], all, cy, amp);
+                float cy = float(g.all.top()) + lh * (k + 0.5f), amp = lh * 0.45f;
+                auto y = [&](float v) { return cy - std::min(1.f, std::max(-1.f, v * fGain)) * amp; };
+                p.setRenderHint(QPainter::Antialiasing, false);
+                p.fillRect(QRectF(g.all.left(), cy, g.all.width(), 1), FQT_TRACK);
+
+                // history and lens: one vertical line per pixel, from min to max
+                fLines.clear();
+                const std::deque<Column>& cols = fCols[k];
+                int visible = int(g.xa - g.all.left());
+                for (int i = 0; i < visible && skip + i < int(cols.size()); i++) {
+                    const Column& c = cols[cols.size() - 1 - skip - i];
+                    float x = g.xa - 1 - i, y0 = y(c.hi), y1 = y(c.lo);
+                    fLines.emplace_back(x, y0, x, std::max(y1, y0 + 1));
+                }
+                p.setPen(QPen(FQT_ACCENT, 1));
+                p.drawLines(fLines.data(), int(fLines.size()));
+
+                // lens: a smooth band from max to min, outlined so that it never gets thinner than the scope line
+                int nl = std::min(int(fLens[k].size()), g.lensW);
+                if (nl > 1) {
+                    QPolygonF band(2 * nl);
+                    for (int i = 0; i < nl; i++) {
+                        const Column& c = fLens[k][i];
+                        float x = g.xj - 0.5f - i;
+                        band[i] = QPointF(x, y(c.hi));
+                        band[2 * nl - 1 - i] = QPointF(x, y(c.lo));
+                    }
+                    p.setRenderHint(QPainter::Antialiasing, true);
+                    p.setPen(fqtLinePen(FQT_ACCENT, 2.0));
+                    p.setBrush(FQT_ACCENT);
+                    p.drawPolygon(band);
+                    p.setBrush(Qt::NoBrush);
+                }
+
+                // scope: older traces fading out, then the newest with its glow
+                p.setRenderHint(QPainter::Antialiasing, true);
+                QColor c = FQT_ACCENT;
+                const std::deque<std::vector<QPointF>>& traces = fTraces[k];
+                for (int i = int(traces.size()) - 1; i >= 1; i--) {
+                    float fade = 1.f - float(i) / (fPersistence + 1);
+                    c.setAlphaF(0.45f * fade * fade);
+                    p.setPen(fqtLinePen(c, 1.5));
+                    paintTrace(p, traces[i], g, cy, amp);
+                }
+                if (!traces.empty()) {
+                    if (fGlow) {
+                        c.setAlphaF(fqtDark() ? 0.22f : 0.14f);
+                        p.setPen(fqtLinePen(c, 7.0));
+                        paintTrace(p, traces[0], g, cy, amp);
+                    }
+                    p.setPen(fqtLinePen(FQT_ACCENT, 2.0));
+                    paintTrace(p, traces[0], g, cy, amp);
+                }
+
+                p.setFont(fqtMeterFont(8));
                 p.setPen(FQT_TEXT_DIM);
-                p.drawText(QRectF(all.left() + 2, cy - lh / 2, 20, lh), Qt::AlignLeft | Qt::AlignVCenter, names[fMidSide][k]);
+                p.drawText(QRectF(g.all.left() + 2, cy - lh / 2, 20, lh), Qt::AlignLeft | Qt::AlignVCenter, names[fMidSide][k]);
             }
+
+            // period followed by the scope and its zoom
+            QStringList info;
+            if (fGain > 1.05f) info << QString::fromUtf8("\u00d7%1").arg(fGain, 0, 'f', 1);
+            if (fFreq > 0.f) info << QString("%1 Hz").arg(fFreq, 0, 'f', fFreq < 100.f ? 1 : 0);
+            if (!info.isEmpty()) {
+                p.setFont(fqtMeterFont(8, false));
+                p.setPen(FQT_TEXT_DIM);
+                p.drawText(QRectF(g.xj, g.all.bottom() - 12, g.scopeW - 2, 12), Qt::AlignRight | Qt::AlignVCenter, info.join("  "));
+            }
+            paintChips(p);
         }
 };
 
@@ -471,14 +838,18 @@ class WaveformModule : public MeterModule
  * hold. Level modes as the MiniMeters Loudness module: RMS fast (0.3 s), RMS
  * slow (1 s), LUFS momentary (0.4 s) and short-term (3 s), K-weighted as in
  * ITU-R BS.1770. The readout shows the louder side (RMS) or the loudness of
- * L + R (LUFS).
+ * L + R (LUFS). LUFS Integrated: gated loudness since the start or the last
+ * reset (absolute gate -70 LUFS, relative gate -10 LU, 400 ms blocks every
+ * 100 ms), the bars show the momentary level. A click on the bars (or on
+ * the readout) selects the next mode; the menu resets the integrated loudness and the
+ * maximum peak (in the tooltip).
  */
 class LevelsModule : public MeterModule
 {
 
     private:
 
-        enum { kRMSFast, kRMSSlow, kLUFSMomentary, kLUFSShortTerm };
+        enum { kRMSFast, kRMSSlow, kLUFSMomentary, kLUFSShortTerm, kLUFSIntegrated };
         static constexpr float kFloor = -60.f;
         static const int kMaxBlocks = 400;      // 10 ms blocks: 4 s of history
 
@@ -509,6 +880,34 @@ class LevelsModule : public MeterModule
         int fMode = kRMSFast;
         float fLoudness = kFloor;
         std::vector<float> fBuffer;
+        std::vector<double> fGating;            // energy of the 400 ms gating blocks (sum of the channels)
+        int fHop = 0;                           // 10 ms blocks since the last gating block
+        int fNewBlocks = 0;                     // 10 ms blocks completed during this tick
+        float fIntegrated = kFloor;
+        float fMaxPeak = kFloor;
+
+        bool isLUFS() const { return fMode == kLUFSMomentary || fMode == kLUFSShortTerm || fMode == kLUFSIntegrated; }
+
+        // BS.1770 gated loudness of the stored blocks (gates compared as energies: no log per block)
+        void integrate()
+        {
+            static const double absolute = std::pow(10.0, (-70.0 + 0.691) / 10.0);
+            double sum = 0.0;
+            int n = 0;
+            for (double z : fGating) if (z > absolute) { sum += z; n++; }
+            if (n == 0) { fIntegrated = kFloor; return; }
+            double gate = std::max(absolute, 0.1 * sum / n);     // -10 LU
+            sum = 0.0; n = 0;
+            for (double z : fGating) if (z > gate) { sum += z; n++; }
+            fIntegrated = n ? float(-0.691 + 10.0 * std::log10(sum / n)) : kFloor;
+        }
+
+        void reset()
+        {
+            fGating.clear();
+            fHop = 0;
+            fIntegrated = fMaxPeak = kFloor;
+        }
 
         void initFilters(Channel& ch)
         {
@@ -552,7 +951,7 @@ class LevelsModule : public MeterModule
 
         static const char* unit(int mode)
         {
-            static const char* units[] = { "RMS", "RMS", "LUFS", "LUFS" };     // momentary / short-term: see the menu
+            static const char* units[] = { "RMS", "RMS", "LUFS", "LUFS", "LUFS" };     // momentary / short-term / integrated: see the menu
             return units[mode];
         }
 
@@ -575,8 +974,10 @@ class LevelsModule : public MeterModule
         virtual void fillMenu(QMenu* menu)
         {
             addChoice(menu, "Level", "mode", fMode,
-                      { "RMS Fast (0.3 s)", "RMS Slow (1 s)", "LUFS Momentary (0.4 s)", "LUFS Short-Term (3 s)" },
-                      { kRMSFast, kRMSSlow, kLUFSMomentary, kLUFSShortTerm });
+                      { "RMS Fast (0.3 s)", "RMS Slow (1 s)", "LUFS Momentary (0.4 s)", "LUFS Short-Term (3 s)", "LUFS Integrated (gated)" },
+                      { kRMSFast, kRMSSlow, kLUFSMomentary, kLUFSShortTerm, kLUFSIntegrated });
+            menu->addSeparator();
+            QObject::connect(menu->addAction("Reset Integrated and Max Peak"), &QAction::triggered, [this]() { reset(); });
         }
 
     public:
@@ -593,17 +994,40 @@ class LevelsModule : public MeterModule
 
         float readoutValue() const
         {
-            bool lufs = (fMode == kLUFSMomentary || fMode == kLUFSShortTerm);
             float loudest = kFloor;
             for (const Channel& ch : fChannels) loudest = std::max(loudest, ch.level);
-            return lufs ? fLoudness : loudest;
+            if (fMode == kLUFSIntegrated) return fIntegrated;
+            return isLUFS() ? fLoudness : loudest;
         }
 
         LevelsModule(const MeterSource& src) : MeterModule(src, "levels")
         {
-            fMode = option("mode", kRMSFast);
+            fMode = std::min(int(kLUFSIntegrated), std::max(0, option("mode", kRMSFast)));
             fitWidth(2);
+            setCursor(Qt::PointingHandCursor);
         }
+
+        virtual void mousePressEvent(QMouseEvent* e)
+        {
+            if (e->button() == Qt::LeftButton) nextMode();
+        }
+
+        // next level mode (click on the bars or on the readout)
+        void nextMode()
+        {
+            fMode = (fMode + 1) % (kLUFSIntegrated + 1);
+            setOption("mode", fMode);
+            optionsChanged();
+        }
+
+        static QString modeName(int mode)
+        {
+            static const char* names[] = { "RMS Fast", "RMS Slow", "LUFS Momentary", "LUFS Short-Term", "LUFS Integrated" };
+            return names[mode];
+        }
+
+        QString mode() const { return modeName(fMode); }
+        QString next() const { return modeName((fMode + 1) % (kLUFSIntegrated + 1)); }
 
         virtual void tick()
         {
@@ -615,6 +1039,7 @@ class LevelsModule : public MeterModule
                 fChannels.assign(nch, Channel());
                 for (Channel& ch : fChannels) initFilters(ch);
                 fRead = w - std::min<uint64_t>(w, uint64_t(fSource.fSampleRate) / 2);
+                reset();
             }
             // process the samples written since the last tick
             int n = int(std::min<uint64_t>(w - fRead, MeterRing::kSize / 2));
@@ -634,19 +1059,36 @@ class LevelsModule : public MeterModule
                     if (++ch.count == blockSize) {
                         ch.blocks.emplace_back(ch.raw / blockSize, ch.weighted / blockSize);
                         if (int(ch.blocks.size()) > kMaxBlocks) ch.blocks.pop_front();
+                        if (c == 0) fNewBlocks++;
                         ch.raw = ch.weighted = 0.0;
                         ch.count = 0;
                     }
                 }
                 float pdb = fqtDB(pk);
+                fMaxPeak = std::max(fMaxPeak, pdb);
                 ch.peak = std::max(pdb, ch.peak - 1.5f);      // fast attack, ~45 dB/s release
                 if (pdb >= ch.hold || ++ch.holdAge > 45) { ch.hold = pdb; ch.holdAge = 0; }
             }
             fRead = w;
 
+            // gating blocks of 400 ms every 100 ms (the channels advance together)
+            int added = fNewBlocks;
+            fNewBlocks = 0;
+            bool changed = false;
+            for (int b = 0; b < added; b++) {
+                if (++fHop < 10) continue;
+                fHop = 0;
+                double z = 0.0;
+                for (const Channel& ch : fChannels) z += mean(ch, 40, true);
+                fGating.push_back(z);
+                changed = true;
+            }
+            if (changed) integrate();
+            setToolTip(QString("Click: next mode (%2)\nMax peak %1 dBFS (reset: right click)\nRight click: options").arg(fMaxPeak <= kFloor ? QString("-inf") : QString::number(fMaxPeak, 'f', 1)).arg(next()));
+
             // levels and readout
-            static const int windows[] = { 30, 100, 40, 300 };    // in blocks of 10 ms
-            bool lufs = (fMode == kLUFSMomentary || fMode == kLUFSShortTerm);
+            static const int windows[] = { 30, 100, 40, 300, 40 };    // in blocks of 10 ms
+            bool lufs = isLUFS();
             double sum = 0.0;
             for (Channel& ch : fChannels) {
                 double ms = mean(ch, windows[fMode], lufs);
@@ -699,7 +1141,8 @@ class LevelsModule : public MeterModule
  * Stereometer of the left/right pair with the correlation meter (+1..-1) on
  * its right, as in MiniMeters. Display modes: Scaled (logarithmic radius,
  * quiet signals stay visible) and Linear (1:1); both rotated by 45 degrees:
- * mid up, side horizontal.
+ * mid up, side horizontal, with faint L, R and mono axes. Phosphor: the
+ * samples fade with their age (the last 2048, in four bands).
  */
 class StereoModule : public MeterModule
 {
@@ -708,14 +1151,17 @@ class StereoModule : public MeterModule
 
         enum { kScaled, kLinear };
         static const int kPoints = 2048;
+        static const int kBands = 4;            // age bands of the phosphor
         std::vector<float> fL, fR;
         std::vector<QPointF> fDots;
         float fCorr = 0.f;
         int fMode = kScaled;
+        int fPhosphor = 1;
 
         virtual void fillMenu(QMenu* menu)
         {
             addChoice(menu, "Display", "mode", fMode, { "Scaled", "Linear" }, { kScaled, kLinear });
+            addChoice(menu, "Phosphor", "phosphor", fPhosphor, { "On", "Off" }, { 1, 0 });
         }
 
         // map a pair of samples to the unit square, center = silence
@@ -738,6 +1184,12 @@ class StereoModule : public MeterModule
         {
             setMinimumWidth(90);
             fMode = option("mode", kScaled) == kLinear ? kLinear : kScaled;
+            fPhosphor = option("phosphor", 1);
+        }
+
+        virtual std::vector<ChipGroup> chipGroups()
+        {
+            return { { "mode", &fMode, { "Scaled", "Linear" }, { kScaled, kLinear } } };
         }
 
         virtual void tick()
@@ -778,100 +1230,40 @@ class StereoModule : public MeterModule
             QRectF area(all.left(), all.top(), bar.left() - lw - 8 - all.left(), all.height());
             float half = std::min(float(area.width()), float(area.height())) / 2;
             QPointF c = area.center();
+
+            // axes: mono (vertical), L and R (diagonals)
+            p.setRenderHint(QPainter::Antialiasing, true);
+            p.setPen(QPen(FQT_TRACK, 1));
+            float d = half * 0.7071f;
+            p.drawLine(QPointF(c.x(), c.y() + half), QPointF(c.x(), c.y() - half));
+            p.drawLine(QPointF(c.x() - d, c.y() - d), QPointF(c.x() + d, c.y() + d));
+            p.drawLine(QPointF(c.x() + d, c.y() - d), QPointF(c.x() - d, c.y() + d));
+            p.setFont(fqtMeterFont(8));
+            p.setPen(FQT_TEXT_DIM);
+            p.drawText(QRectF(c.x() - d - 14, c.y() - d - 14, 12, 12), Qt::AlignCenter, "L");
+            p.drawText(QRectF(c.x() + d + 2, c.y() - d - 14, 12, 12), Qt::AlignCenter, "R");
+
             fDots.clear();
             for (int i = 0; i < int(fL.size()); i++) {
                 QPointF m = map(fL[i], fR[i]);
                 float x = std::max(-1.f, std::min(1.f, float(m.x()))), y = std::max(-1.f, std::min(1.f, float(m.y())));
                 fDots.emplace_back(c.x() + x * half, c.y() - y * half);
             }
-            p.setPen(fqtLinePen(FQT_ACCENT, 2.0));
-            p.drawPoints(fDots.data(), int(fDots.size()));
-        }
-};
-
-//==============================OSCILLOSCOPE=====================================
-
-/**
- * Oscilloscope of L (accent color) and R (dimmed) overlaid, as the spectrum.
- * Follow Pitch: the trace starts on a rising zero crossing of L and its
- * length follows the period (Single: one cycle, Multi: four cycles);
- * otherwise the last 2048 samples, free running.
- */
-class ScopeModule : public MeterModule
-{
-
-    private:
-
-        static const int kWindow = 16384;
-        std::vector<float> fBuffer, fBuffer2, fTrace, fTrace2;
-        int fFollow = 1;
-        int fCycles = 1;
-
-        void paintTrace(QPainter& p, const std::vector<float>& trace, const QRectF& r, const QColor& color)
-        {
-            int len = int(trace.size());
-            if (len < 2) return;
-            QPainterPath path;
-            for (int i = 0; i < len; i++) {
-                float v = std::min(1.f, std::max(-1.f, trace[i]));
-                QPointF pt(r.left() + r.width() * i / (len - 1), r.center().y() - v * r.height() / 2);
-                if (i == 0) path.moveTo(pt); else path.lineTo(pt);
+            // oldest band first; without phosphor only the newest half, at full intensity.
+            // Opaque dots (accent mixed with the background) without antialiasing: Qt draws
+            // opaque points in batches, transparent ones one by one
+            int n = int(fDots.size()), band = n / kBands;
+            QColor bg = FQT_METER_BG, fg = FQT_ACCENT;
+            p.setRenderHint(QPainter::Antialiasing, false);
+            for (int b = fPhosphor ? 0 : kBands / 2; b < kBands; b++) {
+                float t = fPhosphor ? float(b + 1) / kBands : 1.f;
+                t *= t;
+                QColor col(int(bg.red() + (fg.red() - bg.red()) * t), int(bg.green() + (fg.green() - bg.green()) * t),
+                           int(bg.blue() + (fg.blue() - bg.blue()) * t));
+                p.setPen(fqtLinePen(col, 2.0));
+                p.drawPoints(fDots.data() + b * band, (b == kBands - 1) ? n - b * band : band);
             }
-            p.setPen(fqtLinePen(color));
-            p.drawPath(path);
-        }
-
-        virtual void fillMenu(QMenu* menu)
-        {
-            addChoice(menu, "Follow Pitch", "follow", fFollow, { "On", "Off" }, { 1, 0 });
-            addChoice(menu, "Cycle", "cycles", fCycles, { "Single", "Multi" }, { 1, 4 });
-        }
-
-    public:
-
-        ScopeModule(const MeterSource& src) : MeterModule(src, "scope")
-        {
-            setMinimumWidth(50);
-            fFollow = option("follow", 1);
-            fCycles = option("cycles", 1);
-        }
-
-        virtual void tick()
-        {
-            fBuffer.resize(kWindow);
-            fBuffer2.resize(kWindow);
-            fSource.readPair(fBuffer.data(), fBuffer2.data(), kWindow);
-            int len = 2048, start = kWindow - len;
-            if (fFollow) {
-                // rising zero crossings with a small hysteresis, searched backwards
-                std::vector<int> ups;
-                bool below = false;
-                for (int i = kWindow - 1; i > 0 && int(ups.size()) <= fCycles + 1; i--) {
-                    if (fBuffer[i] < -1e-4f) below = true;
-                    if (below && fBuffer[i - 1] <= 0.f && fBuffer[i] > 0.f) { ups.push_back(i); below = false; }
-                }
-                if (int(ups.size()) > fCycles + 1) {
-                    int period = ups[0] - ups[1];
-                    len = std::min(std::max(fCycles * period, 32), kWindow / 2);
-                    start = ups[fCycles + 1];
-                    if (start + len > kWindow) start = kWindow - len;
-                }
-            }
-            fTrace.assign(fBuffer.begin() + start, fBuffer.begin() + start + len);
-            fTrace2.assign(fBuffer2.begin() + start, fBuffer2.begin() + start + len);
-            update();
-        }
-
-        virtual void paintGL()
-        {
-            QPainter p(this);
-            paintBackground(p);
-            QRectF r = QRectF(rect()).adjusted(6, 8, -6, -8);
-            p.setPen(QPen(FQT_TRACK, 1));
-            p.drawLine(QPointF(r.left(), r.center().y()), QPointF(r.right(), r.center().y()));
-            p.setRenderHint(QPainter::Antialiasing, true);
-            paintTrace(p, fTrace2, r, FQT_TEXT_DIM);
-            paintTrace(p, fTrace, r, FQT_ACCENT);
+            paintChips(p);
         }
 };
 
@@ -884,7 +1276,11 @@ class ScopeModule : public MeterModule
  * note). The FFT size (2048, 4096 or 8192 at 48 kHz) grows with the sample
  * rate, so that the frequency resolution does not depend on it. Two curves,
  * as in MiniMeters: L and R, or Mid and Side; the first in the accent color,
- * the second dimmed.
+ * the second dimmed. The first curve has a peak hold curve (dotted, slow
+ * decay). Spectrogram view: the louder of the
+ * two curves, time scrolling to the left (newest on the right, as the
+ * waveform), logarithmic frequency going up; analysed only while shown.
+ * Mode chips (mouse over the module): Curves / Spectrogram, L/R / M/S.
  */
 class SpectrumModule : public MeterModule
 {
@@ -905,11 +1301,20 @@ class SpectrumModule : public MeterModule
         std::vector<std::complex<float>> fFFT, fTwiddle;
         std::vector<int> fBitRev;
         float fPeakFreq = 0.f, fPeakDB = -200.f;
+        enum { kCurves, kSpectrogram };
+        int fView = kCurves;
+        int fHoldOn = 1;
+        int fHistory = 1;                               // spectrogram: ticks per row
+        std::vector<float> fHold;                       // peak hold of the first curve
+        QImage fSpec;                                   // spectrogram, one byte per pixel, columns in a ring
+        int fSpecHead = 0, fSpecTicks = 0;              // newest column
+        std::vector<QPointF> fCurve;
 
         void init()
         {
             int n = fSize;
             for (int c = 0; c < 2; c++) { fBuffer[c].assign(n, 0.f); fSmooth[c].assign(n / 2, -200.f); }
+            fHold.assign(n / 2, -200.f);
             fWindow.resize(n); fFFT.resize(n); fTwiddle.resize(n / 2); fBitRev.resize(n);
             double sum = 0;
             for (int i = 0; i < n; i++) { fWindow[i] = float(0.5 - 0.5 * std::cos(2 * M_PI * i / (n - 1))); sum += fWindow[i]; }
@@ -959,6 +1364,9 @@ class SpectrumModule : public MeterModule
             addChoice(menu, "Display", "channels", fChannels, { "Left / Right", "Mid / Side" }, { kLeftRight, kMidSide });
             addChoice(menu, "FFT Size (at 48 kHz)", "size", fSizeOption, { "2048", "4096", "8192" }, { 2048, 4096, 8192 });
             addChoice(menu, "Smoothing", "smoothing", fSmoothing, { "Low", "Medium", "High" }, { 50, 85, 95 });
+            addChoice(menu, "View", "view", fView, { "Curves", "Spectrogram" }, { kCurves, kSpectrogram });
+            addChoice(menu, "Peak Hold", "hold", fHoldOn, { "On", "Off" }, { 1, 0 });
+            addChoice(menu, "Spectrogram Speed", "history", fHistory, { "Fast (60 columns / s)", "Slow (15 columns / s)" }, { 1, 4 });
         }
 
         // FFT size for the sample rate: x2 at 96 kHz, x4 at 192 kHz
@@ -970,7 +1378,7 @@ class SpectrumModule : public MeterModule
             if (int(fWindow.size()) != fSize) init();
         }
 
-        virtual void optionsChanged() { updateSize(); }
+        virtual void optionsChanged() { updateSize(); fSpec = QImage(); }
 
         float maxFreq() const { return std::min(fSource.fSampleRate / 2.f, 24000.f); }
         float binHz() const { return float(fSource.fSampleRate) / fSize; }
@@ -984,9 +1392,10 @@ class SpectrumModule : public MeterModule
         float yOf(float db, const QRectF& r) const { return float(r.top() + r.height() * (kTop - db) / (kTop - kBottom)); }
 
         // highest smoothed level of curve 'c' between two frequencies (interpolated inside a single bin)
-        float levelBetween(int c, float f0, float f1) const
+        float levelBetween(int c, float f0, float f1) const { return levelBetween(fSmooth[c], f0, f1); }
+
+        float levelBetween(const std::vector<float>& sm, float f0, float f1) const
         {
-            const std::vector<float>& sm = fSmooth[c];
             int last = fSize / 2 - 1;
             int k0 = std::max(1, int(f0 / binHz())), k1 = std::min(last, std::max(k0, int(f1 / binHz())));
             if (k1 > k0) {
@@ -998,17 +1407,63 @@ class SpectrumModule : public MeterModule
             return sm[k0] * (1 - t) + sm[std::min(k0 + 1, last)] * t;
         }
 
-        void paintCurve(QPainter& p, int c, const QRectF& r, const QColor& color)
+        // one point per pixel of a spectrum (tilted)
+        void curvePoints(const std::vector<float>& sm, const QRectF& r)
         {
-            QPainterPath path;
+            fCurve.clear();
             for (int x = int(r.left()); x <= int(r.right()); x++) {
                 float f0 = fOf(float(x), r), f1 = fOf(float(x + 1), r);
-                float y = std::min(float(r.bottom()) + 2.f, yOf(levelBetween(c, f0, f1) + tilt(f0), r));
-                QPointF pt(x, std::max(float(r.top()), y));
-                if (x == int(r.left())) path.moveTo(pt); else path.lineTo(pt);
+                float y = std::min(float(r.bottom()) + 2.f, yOf(levelBetween(sm, f0, f1) + tilt(f0), r));
+                fCurve.emplace_back(x, std::max(float(r.top()), y));
             }
+        }
+
+        void paintCurve(QPainter& p, int c, const QRectF& r, const QColor& color)
+        {
+            curvePoints(fSmooth[c], r);
             p.setPen(fqtLinePen(color));
-            p.drawPath(path);
+            p.drawPolyline(fCurve.data(), int(fCurve.size()));
+        }
+
+        // vertical position of a frequency in the spectrogram (logarithmic, low at the bottom)
+        float yOfFreq(float f, const QRectF& r) const { return float(r.bottom() - r.height() * warp(f)); }
+
+        // spectrogram column: level of the louder curve per pixel row, 0..255
+        void spectrogramColumn(const QRectF& r)
+        {
+            int w = int(r.width()), h = int(r.height());
+            if (w < 2 || h < 2) return;
+            if (fSpec.width() != w || fSpec.height() != h) {
+                fSpec = QImage(w, h, QImage::Format_Indexed8);
+                fSpec.fill(0);
+                fSpecHead = 0;
+            }
+            if (++fSpecTicks < fHistory) return;
+            fSpecTicks = 0;
+            fSpecHead = (fSpecHead + 1) % w;
+            for (int y = 0; y < h; y++) {
+                float f0 = unwarp(float(h - 1 - y) / h), f1 = unwarp(float(h - y) / h);
+                float db = std::max(levelBetween(0, f0, f1), levelBetween(1, f0, f1)) + tilt(f0);
+                float t = std::min(1.f, std::max(0.f, (db - kBottom) / (kTop - kBottom)));
+                fSpec.scanLine(y)[fSpecHead] = uchar(255.f * t * t);    // quadratic: the noise floor stays dark
+            }
+        }
+
+        void paintSpectrogram(QPainter& p, const QRectF& r)
+        {
+            if (fSpec.isNull()) return;
+            // color table from the theme: background to accent
+            QColor a = FQT_METER_BG, b = FQT_ACCENT;
+            QVector<QRgb> table(256);
+            for (int i = 0; i < 256; i++) {
+                float t = i / 255.f;
+                table[i] = qRgb(int(a.red() + (b.red() - a.red()) * t), int(a.green() + (b.green() - a.green()) * t), int(a.blue() + (b.blue() - a.blue()) * t));
+            }
+            fSpec.setColorTable(table);
+            // oldest columns (after the head) on the left, newest on the right
+            int w = fSpec.width(), h = fSpec.height(), old = w - fSpecHead - 1;
+            if (old > 0) p.drawImage(QRectF(r.left(), r.top(), old, h), fSpec, QRectF(fSpecHead + 1, 0, old, h));
+            p.drawImage(QRectF(r.left() + old, r.top(), fSpecHead + 1, h), fSpec, QRectF(0, 0, fSpecHead + 1, h));
         }
 
         static QString note(float f)
@@ -1028,9 +1483,20 @@ class SpectrumModule : public MeterModule
             fChannels = option("channels", kLeftRight) == kMidSide ? kMidSide : kLeftRight;
             fSmoothing = option("smoothing", 85);
             fSizeOption = option("size", 4096);
+            fView = option("view", kCurves) == kSpectrogram ? kSpectrogram : kCurves;
+            fHoldOn = option("hold", 1);
+            fHistory = option("history", 1) == 4 ? 4 : 1;
             if (fSizeOption != 2048 && fSizeOption != 8192) fSizeOption = 4096;
             updateSize();
         }
+
+        virtual std::vector<ChipGroup> chipGroups()
+        {
+            return { { "view", &fView, { "Curves", "Spectrogram" }, { kCurves, kSpectrogram } },
+                     { "channels", &fChannels, { "L/R", "M/S" }, { kLeftRight, kMidSide } } };
+        }
+
+        virtual QPointF chipOrigin() const { return QPointF(8, 18); }   // below the frequency labels
 
         virtual void tick()
         {
@@ -1043,7 +1509,15 @@ class SpectrumModule : public MeterModule
                 }
             }
             for (int c = 0; c < 2; c++) analyse(c);
-            
+            if (fHoldOn) {
+                for (int k = 1; k < fSize / 2; k++) fHold[k] = std::max(fSmooth[0][k], fHold[k] - 0.1f);     // ~6 dB/s
+            }
+            if (fView == kSpectrogram) {
+                spectrogramColumn(QRectF(rect()).adjusted(4, 4, -4, -2));
+                update();
+                return;     // no readout in the spectrogram
+            }
+
             // loudest bin (tilted) over the curves, refined by parabolic interpolation
             int best = 1, bestCurve = 0;
             for (int c = 0; c < 2; c++) {
@@ -1068,6 +1542,7 @@ class SpectrumModule : public MeterModule
             QPainter p(this);
             paintBackground(p);
             QRectF r = QRectF(rect()).adjusted(4, 4, -4, -2);
+            if (fView == kSpectrogram) paintSpectrogram(p, r);
             p.setFont(fqtMeterFont(8, false));
             QFontMetricsF fm(p.font());
 
@@ -1077,16 +1552,27 @@ class SpectrumModule : public MeterModule
                 for (int k = 1; k < 10; k++) {
                     float f = dec * k;
                     if (f < kMinFreq || f > maxFreq()) continue;
-                    float x = xOf(f, r);
                     p.setPen(QPen(FQT_TRACK, 1));
+                    if (fView == kSpectrogram) {
+                        // decades only (horizontal lines), labels on the left above their line
+                        if (k != 1) continue;
+                        float yy = yOfFreq(f, r);
+                        p.drawLine(QPointF(r.left(), yy), QPointF(r.right(), yy));
+                        if (k == 1 && dec >= 100.f && yy - 12 > r.top()) {
+                            p.setPen(FQT_TEXT_DIM);
+                            p.drawText(QPointF(r.left() + 3, yy - 3), dec >= 1000.f ? QString("%1kHz").arg(int(dec / 1000)) : QString("%1Hz").arg(int(dec)));
+                        }
+                        continue;
+                    }
+                    float x = xOf(f, r);
                     p.drawLine(QPointF(x, r.top()), QPointF(x, r.bottom()));
                     if (k == 1 && dec >= 100.f) {
                         QString label = dec >= 1000.f ? QString("%1kHz").arg(int(dec / 1000)) : QString("%1Hz").arg(int(dec));
                         float w = fm.horizontalAdvance(label);
                         // labels on the right of their line, on the left near the window buttons,
                         // skipped when they would overlap the previous one
-                        float lx = (x + 3 + w > width() - 64) ? x - 3 - w : x + 3;
-                        if (lx < lastLabel + 6 || lx < r.left() || lx + w > width() - 64) continue;
+                        float lx = (x + 3 + w > width() - 34) ? x - 3 - w : x + 3;
+                        if (lx < lastLabel + 6 || lx < r.left() || lx + w > width() - 34) continue;
                         p.setPen(FQT_TEXT_DIM);
                         p.drawText(QPointF(lx, r.top() + 10), label);
                         lastLabel = lx + w;
@@ -1096,18 +1582,30 @@ class SpectrumModule : public MeterModule
 
             // curves: the second one first (dimmed), the first one on top
             p.setRenderHint(QPainter::Antialiasing, true);
-            paintCurve(p, 1, r, FQT_TEXT_DIM);
-            paintCurve(p, 0, r, FQT_ACCENT);
+            if (fView == kCurves) {
+                if (fHoldOn) {
+                    // peak hold: thin dotted line in the accent color, no gray
+                    curvePoints(fHold, r);
+                    QPen pen = fqtLinePen(FQT_ACCENT, 1.0);
+                    pen.setStyle(Qt::DotLine);
+                    p.setPen(pen);
+                    p.drawPolyline(fCurve.data(), int(fCurve.size()));
+                }
+                paintCurve(p, 1, r, FQT_TEXT_DIM);
+                paintCurve(p, 0, r, FQT_ACCENT);
+            }
 
             // legend: L R or M S in the colors of the curves, bottom left
-            p.setFont(fqtMeterFont(9));
-            p.setPen(FQT_ACCENT);
-            p.drawText(QPointF(r.left() + 4, r.bottom() - 4), fChannels == kMidSide ? "M" : "L");
-            p.setPen(FQT_TEXT_DIM);
-            p.drawText(QPointF(r.left() + 16, r.bottom() - 4), fChannels == kMidSide ? "S" : "R");
+            if (fView == kCurves) {
+                p.setFont(fqtMeterFont(9));
+                p.setPen(FQT_ACCENT);
+                p.drawText(QPointF(r.left() + 4, r.bottom() - 4), fChannels == kMidSide ? "M" : "L");
+                p.setPen(FQT_TEXT_DIM);
+                p.drawText(QPointF(r.left() + 16, r.bottom() - 4), fChannels == kMidSide ? "S" : "R");
+            }
 
-            // readout of the loudest frequency
-            if (fPeakDB > -120.f && fPeakFreq > kMinFreq) {
+            // readout of the loudest frequency (curves only)
+            if (fView == kCurves && fPeakDB > -120.f && fPeakFreq > kMinFreq) {
                 p.setFont(fqtReadoutFont());
                 QFontMetrics pfm(p.font());
                 QString txt = QString("%1dB | %2Hz | %3").arg(fPeakDB, 0, 'f', 2).arg(fPeakFreq, 0, 'f', 2).arg(note(fPeakFreq));
@@ -1117,12 +1615,14 @@ class SpectrumModule : public MeterModule
                 float px = std::max(float(r.left()), std::min(xOf(fPeakFreq, r) + 6, float(r.right() - box.width())));
                 float py = std::max(float(r.top()) + 14.f, yOf(fPeakDB + tilt(fPeakFreq), r));
                 box.moveTo(px, std::min(py, float(r.bottom() - box.height())));
-                // keep clear of the window buttons in the top right corner
-                if (box.right() > width() - 64 && box.top() < 32) box.moveTop(32);
+                // keep clear of the window buttons in the top right corner, and of the mode chips
+                if (box.right() > width() - 34 && box.top() < 32) box.moveTop(32);
+                if (fHover && box.top() < 38) box.moveTop(38);
                 p.fillRect(box, FQT_METER_BG);
                 p.setPen(FQT_TEXT);
                 p.drawText(box, Qt::AlignCenter, txt);
             }
+            paintChips(p);
         }
 };
 
@@ -1183,8 +1683,10 @@ class FitView : public QGraphicsView
 
 /**
  * Readout of the levels module: a small box floating over the left edge of
- * the next module, at the height of the level (as in MiniMeters). It lets
- * the mouse through.
+ * the next module, at the height of the level (as in MiniMeters). It is also
+ * the mode control of the levels: while the mouse is over the levels or the
+ * box, it shows a chevron (clickable, as the mode chips of the other modules);
+ * a click selects the next level mode.
  */
 class MeterReadout : public QWidget
 {
@@ -1192,21 +1694,41 @@ class MeterReadout : public QWidget
     private:
 
         QString fText;
+        bool fHover = false;
+        std::function<void()> fClicked;
+
+        void fit()
+        {
+            QFontMetrics fm(fqtMeterFont(10));
+            resize(fm.horizontalAdvance(fText) + 8 + (fHover ? 12 : 0), fm.height() + 2);
+        }
 
     public:
 
-        MeterReadout(QWidget* parent) : QWidget(parent)
+        MeterReadout(QWidget* parent, std::function<void()> clicked) : QWidget(parent), fClicked(clicked)
         {
-            setAttribute(Qt::WA_TransparentForMouseEvents);
+            setCursor(Qt::PointingHandCursor);
         }
 
         void setText(const QString& text)
         {
             if (text == fText) return;
             fText = text;
-            QFontMetrics fm(fqtMeterFont(10));
-            resize(fm.horizontalAdvance(text) + 8, fm.height() + 2);
+            fit();
             update();
+        }
+
+        void setHover(bool hover)
+        {
+            if (hover == fHover) return;
+            fHover = hover;
+            fit();
+            update();
+        }
+
+        virtual void mousePressEvent(QMouseEvent* e)
+        {
+            if (e->button() == Qt::LeftButton) fClicked();
         }
 
         virtual void paintEvent(QPaintEvent*)
@@ -1215,7 +1737,9 @@ class MeterReadout : public QWidget
             p.fillRect(rect(), FQT_ACCENT);
             p.setFont(fqtMeterFont(10));
             p.setPen(FQT_METER_BG);
-            p.drawText(rect(), Qt::AlignCenter, fText);
+            QRect text = rect().adjusted(0, 0, fHover ? -12 : 0, 0);
+            p.drawText(text, Qt::AlignCenter, fText);
+            if (fHover) p.drawText(QRect(text.right(), 0, 12, height()), Qt::AlignCenter, QString::fromUtf8("\u25B8"));
         }
 };
 
@@ -1346,12 +1870,229 @@ class MeterRouting : public QWidget
 };
 
 /**
+ * Status bar below the controls, always shown (also with the strip closed),
+ * updated once per second, repainted only when what it shows has changed
+ * (a repaint recomposes the whole window, which holds OpenGL widgets):
+ * - one small bar per CPU core (load of the whole system, any number of cores),
+ *   the total and the share of the application, both in % of the whole Mac
+ *   (the tooltip also gives the application in % of one core);
+ * - the DSP load: time spent in the DSP compute / duration of the block
+ *   (average and worst block of the period), and the number of "late" blocks,
+ *   computed in more time than their duration (likely dropouts);
+ * - the block size measured in the audio callback (CoreAudio does not show
+ *   it), its duration, the sample rate;
+ * - the default output device and its output latency (buffer + device
+ *   latency + safety offset).
+ * Cost: a few system calls per update, nothing on the audio thread except
+ * two clock reads per block (MeterTiming).
+ */
+class MeterStatusBar : public QWidget
+{
+
+    private:
+
+        MeterTiming& fTiming;
+        int fSampleRate;
+        QTimer fTimer;
+        int fUpdates = 0;
+
+        // system and application CPU
+        std::vector<uint64_t> fBusy, fTotal;    // ticks per core at the last update
+        std::vector<float> fCores;              // load per core, 0..1
+        float fSystem = 0.f, fApp = 0.f;
+        double fAppTime = 0.0;
+        std::chrono::steady_clock::time_point fWall;
+
+        // audio
+        uint64_t fBusyNs = 0, fSamples = 0;
+        float fLoad = 0.f, fWorstLoad = 0.f;
+        int fBlock = 0, fBlockMin = 0, fBlockMax = 0;
+        uint64_t fLate = 0;
+
+        // device
+        QString fDevice;
+        float fLatencyMs = 0.f;
+        int fDeviceBuffer = 0;
+
+        void readCPU()
+        {
+#ifdef __APPLE__
+            natural_t count = 0;
+            processor_info_array_t info = nullptr;
+            mach_msg_type_number_t size = 0;
+            if (host_processor_info(mach_host_self(), PROCESSOR_CPU_LOAD_INFO, &count, &info, &size) == KERN_SUCCESS) {
+                processor_cpu_load_info_t load = (processor_cpu_load_info_t)info;
+                fBusy.resize(count, 0); fTotal.resize(count, 0); fCores.resize(count, 0.f);
+                float sum = 0.f;
+                for (natural_t c = 0; c < count; c++) {
+                    const unsigned int* t = load[c].cpu_ticks;
+                    uint64_t busy = uint64_t(t[CPU_STATE_USER]) + t[CPU_STATE_SYSTEM] + t[CPU_STATE_NICE];
+                    uint64_t total = busy + t[CPU_STATE_IDLE];
+                    uint64_t db = busy - fBusy[c], dt = total - fTotal[c];
+                    if (fTotal[c] > 0 && dt > 0) fCores[c] = float(db) / float(dt);
+                    fBusy[c] = busy; fTotal[c] = total;
+                    sum += fCores[c];
+                }
+                fSystem = count ? sum / count : 0.f;
+                vm_deallocate(mach_task_self(), vm_address_t(info), vm_size_t(size) * sizeof(integer_t));
+            }
+            struct rusage ru;
+            getrusage(RUSAGE_SELF, &ru);
+            double t = ru.ru_utime.tv_sec + ru.ru_stime.tv_sec + 1e-6 * (ru.ru_utime.tv_usec + ru.ru_stime.tv_usec);
+            auto now = std::chrono::steady_clock::now();
+            double wall = std::chrono::duration<double>(now - fWall).count();
+            if (fAppTime > 0.0 && wall > 0.0) fApp = float((t - fAppTime) / wall);
+            fAppTime = t;
+            fWall = now;
+#endif
+        }
+
+        void readAudio()
+        {
+            uint64_t busy = fTiming.fBusyNs.load(std::memory_order_relaxed);
+            uint64_t samples = fTiming.fSamples.load(std::memory_order_relaxed);
+            if (samples > fSamples && fSampleRate > 0) {
+                fLoad = float(double(busy - fBusyNs) * fSampleRate / (double(samples - fSamples) * 1e9));
+            }
+            fBusyNs = busy; fSamples = samples;
+            fWorstLoad = float(double(fTiming.fWorst.exchange(0, std::memory_order_relaxed)) * fSampleRate / (1024.0 * 1e9));
+            fBlock = fTiming.fBlock.load(std::memory_order_relaxed);
+            fBlockMin = fTiming.fBlockMin.exchange(INT_MAX, std::memory_order_relaxed);
+            fBlockMax = fTiming.fBlockMax.exchange(0, std::memory_order_relaxed);
+            if (fBlockMin == INT_MAX) fBlockMin = fBlockMax = fBlock;
+            fLate = fTiming.fLate.load(std::memory_order_relaxed);
+        }
+
+#ifdef __APPLE__
+        template <typename T>
+        static bool property(AudioObjectID id, AudioObjectPropertySelector sel, AudioObjectPropertyScope scope, T& value)
+        {
+            AudioObjectPropertyAddress a = { sel, scope, kAudioObjectPropertyElementMain };
+            UInt32 size = sizeof(T);
+            return AudioObjectGetPropertyData(id, &a, 0, nullptr, &size, &value) == noErr;
+        }
+#endif
+
+        void readDevice()
+        {
+#ifdef __APPLE__
+            AudioObjectID dev = 0;
+            if (!property(kAudioObjectSystemObject, kAudioHardwarePropertyDefaultOutputDevice, kAudioObjectPropertyScopeGlobal, dev) || !dev) return;
+            CFStringRef name = nullptr;
+            if (property(dev, kAudioObjectPropertyName, kAudioObjectPropertyScopeGlobal, name) && name) {
+                char buf[256] = { 0 };
+                if (CFStringGetCString(name, buf, sizeof(buf), kCFStringEncodingUTF8)) fDevice = QString::fromUtf8(buf);
+                CFRelease(name);
+            }
+            UInt32 buffer = 0, latency = 0, safety = 0;
+            property(dev, kAudioDevicePropertyBufferFrameSize, kAudioObjectPropertyScopeGlobal, buffer);
+            property(dev, kAudioDevicePropertyLatency, kAudioObjectPropertyScopeOutput, latency);
+            property(dev, kAudioDevicePropertySafetyOffset, kAudioObjectPropertyScopeOutput, safety);
+            fDeviceBuffer = int(buffer);
+            fLatencyMs = fSampleRate > 0 ? 1000.f * float(buffer + latency + safety) / fSampleRate : 0.f;
+#endif
+        }
+
+        void refresh()
+        {
+            readCPU();
+            readAudio();
+            if (fUpdates++ % 2 == 0) readDevice();      // every 2 s: the default device may change
+            QStringList tip;
+            QStringList cores;
+            for (int c = 0; c < int(fCores.size()); c++) cores << QString("%1").arg(int(std::lround(fCores[c] * 100)));
+            tip << QString("CPU per core (%): %1").arg(cores.join(" "))
+                << QString("cpu: whole Mac %1%, app: share of the whole Mac %2% (= %3% of one core, as in Activity Monitor)")
+                       .arg(int(std::lround(fSystem * 100))).arg(int(std::lround(fApp * 100 / std::max<size_t>(1, fCores.size())))).arg(int(std::lround(fApp * 100)))
+                << QString("DSP load: time in the DSP compute / duration of the block, average and worst block")
+                << QString("Late blocks: computed in more time than their duration (%1 since the start)").arg(fLate)
+                << QString("Block size from the audio callback: %1 (min %2, max %3), device buffer %4")
+                       .arg(fBlock).arg(fBlockMin).arg(fBlockMax).arg(fDeviceBuffer)
+                << QString("Output latency: device buffer + latency + safety offset");
+            if (tip.join("\n") != toolTip()) setToolTip(tip.join("\n"));
+
+            // what is shown: bar heights and texts; repaint only when they change
+            std::vector<int> bars;
+            for (float load : fCores) bars.push_back(int(std::lround(10.f * std::min(1.f, std::max(0.f, load)))));
+            auto pct = [](float v) { return QString("%1%").arg(int(std::lround(v * 100))); };
+            float blockMs = fSampleRate > 0 ? 1000.f * fBlock / fSampleRate : 0.f;
+            QString block = (fBlockMin != fBlockMax) ? QString("%1-%2").arg(fBlockMin).arg(fBlockMax) : QString::number(fBlock);
+            QStringList items;
+            items << QString("cpu %1").arg(pct(fSystem))
+                  << QString("app %1").arg(pct(fCores.empty() ? fApp : fApp / fCores.size()))
+                  << QString("dsp %1 (max %2)").arg(pct(fLoad)).arg(pct(fWorstLoad))
+                  << QString("block %1 (%2 ms)").arg(block).arg(blockMs, 0, 'f', 1)
+                  << QString("%1 kHz").arg(fSampleRate / 1000.0, 0, 'g', 4)
+                  << QString("late %1").arg(fLate);
+            QString right = fDevice.isEmpty() ? QString() : QString("%1 \u00b7 out %2 ms").arg(fDevice).arg(fLatencyMs, 0, 'f', 1);
+            if (bars != fBars || items != fItems || right != fRight) {
+                fBars = bars; fItems = items; fRight = right;
+                update();
+            }
+        }
+
+        std::vector<int> fBars;     // shown: bar heights (0..10)
+        QStringList fItems;         // shown: texts
+        QString fRight;
+
+    public:
+
+        static const int kHeight = 20;
+
+        MeterStatusBar(MeterTiming& timing, int sample_rate) : fTiming(timing), fSampleRate(sample_rate)
+        {
+            setFixedHeight(kHeight);
+            fWall = std::chrono::steady_clock::now();
+            QObject::connect(&fTimer, &QTimer::timeout, [this]() { refresh(); });
+            fTimer.start(1000);
+            refresh();
+        }
+
+        virtual void paintEvent(QPaintEvent*)
+        {
+            QPainter p(this);
+            p.fillRect(rect(), FQT_COLOR(0xf5f5f7, 0x1c1c1e));
+            p.fillRect(QRectF(0, 0, width(), 1), FQT_BORDER);
+            p.setFont(fqtMeterFont(9, false));
+            QFontMetrics fm(p.font());
+            float x = 8, cy = height() / 2.f + 0.5f;
+
+            // one bar per core
+            float bh = 10.f;
+            for (int h : fBars) {
+                QRectF bar(x, cy - bh / 2, 3, bh);
+                p.fillRect(bar, FQT_TRACK);
+                p.fillRect(QRectF(bar.left(), bar.bottom() - h, 3, h), FQT_SIGNAL);
+                x += 4;
+            }
+            x += 6;
+
+            const QStringList& items = fItems;
+            const QString& right = fRight;
+            int rightW = right.isEmpty() ? 0 : fm.horizontalAdvance(right) + 16;
+            QString sep = QString::fromUtf8("  ·  ");
+            for (int i = 0; i < items.size(); i++) {
+                QString t = (i ? sep : QString()) + items[i];
+                int w = fm.horizontalAdvance(t);
+                if (x + w > width() - 8 - rightW && i > 0) { rightW = 0; if (x + w > width() - 8) break; }
+                // late blocks in the clip color, as a warning
+                p.setPen(i == items.size() - 1 && fLate > 0 ? FQT_CLIP : FQT_TEXT_DIM);
+                p.drawText(QPointF(x, cy + fm.ascent() / 2.f - 1), t);
+                x += w;
+            }
+            if (rightW > 0 && x + rightW <= width() - 8) {
+                p.setPen(FQT_TEXT_DIM);
+                p.drawText(QRectF(0, 0, width() - 8, height()), Qt::AlignRight | Qt::AlignVCenter, right);
+            }
+        }
+};
+
+/**
  * The strip: the modules side by side (MiniMeters horizontal layout),
  * separated by 1 px lines, with a round button in the top left corner (same
- * style as the window buttons on the right) showing what is routed to L and R,
- * that opens the routing matrix. It sits in a vertical splitter above the controls: drag the divider
- * to resize it or to close it; the round button next to the theme button of
- * QTUI.h closes it or reopens it at its last height (saved per application).
+ * style as the window buttons on the right, routing in its tooltip) that
+ * opens the routing matrix. It sits in a vertical splitter above the controls: drag the divider
+ * to resize it, up to close it, down to reopen it (height saved per application).
  *
  * Usage (see ca-qt-meters.cpp):
  *      MetersPanel* meters = MetersPanel::attach(window, meterDSP, sample_rate);   // before QTGUI::run()
@@ -1377,8 +2118,7 @@ class MetersPanel : public QWidget
         MeterReadout* fReadout = nullptr;
         QMainWindow* fWindow = nullptr;
         QSplitter* fSplitter = nullptr;
-        QToolButton* fToggle = nullptr;
-        int fLastHeight = kHeight;          // height to restore when reopened
+        MeterStatusBar* fStatus = nullptr;
 
         static QSettings settings() { return QSettings("Faust", QCoreApplication::applicationName()); }
 
@@ -1393,11 +2133,11 @@ class MetersPanel : public QWidget
         }
 
         // routing button text ("O1 | O2") and saved routing
+        // routing button: an icon, the routing in its tooltip
         void routingChanged()
         {
-            QString text = fSource.label(MeterSource::kLeft) + " | " + fSource.label(MeterSource::kRight);
-            fRoutingButton->setText(text);
-            fRoutingButton->setFixedWidth(QFontMetrics(fRoutingButton->font()).horizontalAdvance(text) + 22);
+            fRoutingButton->setToolTip(QString("Routing: L = %1, R = %2\nClick: inputs and outputs shown as L and R")
+                                       .arg(fSource.label(MeterSource::kLeft)).arg(fSource.label(MeterSource::kRight)));
             settings().setValue("meters/route_l", fSource.save(MeterSource::kLeft));
             settings().setValue("meters/route_r", fSource.save(MeterSource::kRight));
         }
@@ -1416,6 +2156,8 @@ class MetersPanel : public QWidget
             QString text = fLevels->readoutText();
             fReadout->setVisible(!text.isEmpty());
             fReadout->setText(text);
+            fReadout->setHover(fLevels->underMouse() || fReadout->underMouse());
+            fReadout->setToolTip(QString("%1\nClick: %2").arg(fLevels->mode()).arg(fLevels->next()));
             QRect g = fLevels->geometry();
             int y = g.top() + int(fLevels->readoutY()) - fReadout->height() / 2;
             y = std::max(g.top() + 2, std::min(y, g.bottom() - fReadout->height() - 2));
@@ -1429,40 +2171,14 @@ class MetersPanel : public QWidget
             static_cast<QHBoxLayout*>(layout())->addWidget(m, stretch);
         }
 
-        // the toggle sits on the left of the theme button (22 px wide, 6 px from the edge)
-        void placeToggle()
-        {
-            if (fToggle) {
-                fToggle->move(fWindow->width() - 22 - 6 - fToggle->width() - 6, 4);
-                fToggle->raise();
-            }
-        }
-
         bool isOpen() const { return fSplitter && fSplitter->sizes().value(0) > 0; }
-
-        // toggle button: open at the last height or close, growing or shrinking the window
-        void setOpen(bool open)
-        {
-            int current = fSplitter->sizes().value(0);
-            int controls = fSplitter->sizes().value(1);
-            int h = open ? fLastHeight : 0;
-            if (h == current) return;
-            QScreen* screen = QGuiApplication::primaryScreen();
-            int maxH = screen ? screen->availableGeometry().height() - 40 : 900;
-            fWindow->resize(fWindow->width(), std::min(fWindow->height() + h - current, maxH));
-            fSplitter->setSizes({ h, controls });
-            saveState();
-        }
 
         void saveState()
         {
             int h = fSplitter->sizes().value(0);
             // closed strip: hide the modules, so that nothing is drawn or composited
             for (MeterModule* m : fModules) m->setVisible(h > 0);
-            if (h > 0) fLastHeight = h;
-            fToggle->setToolTip(h > 0 ? "Hide meters (or drag the divider)" : "Show meters (or drag the divider down)");
             settings().setValue("meters/height", h);
-            settings().setValue("meters/last_height", fLastHeight);
         }
 
     public:
@@ -1479,22 +2195,22 @@ class MetersPanel : public QWidget
             }
             setMinimumHeight(kMinHeight);
             setMaximumHeight(kMaxHeight);
-            fLastHeight = std::max(int(kMinHeight), settings().value("meters/last_height", kHeight).toInt());
 
             QHBoxLayout* row = new QHBoxLayout(this);
             row->setContentsMargins(0, 0, 0, 1);    // bottom line
             row->setSpacing(1);                     // separators: the panel background shows through
 
             // order and proportions of the MiniMeters horizontal layout
-            addModule(new WaveformModule(fSource), 386);
+            // (the oscilloscope continues the waveform, in the same module)
+            addModule(new WaveScopeModule(fSource), 547);
             fLevels = new LevelsModule(fSource);
             addModule(fLevels, 0);
             addModule(new StereoModule(fSource), 341);
-            addModule(new ScopeModule(fSource), 161);
             addModule(new SpectrumModule(fSource), 423);
 
-            fReadout = new MeterReadout(this);
-            fRoutingButton = roundButton(this, 60, "Routing: inputs and outputs shown as L and R");
+            fReadout = new MeterReadout(this, [this]() { fLevels->nextMode(); });
+            fRoutingButton = roundButton(this, 22, QString());
+            fRoutingButton->setText(QString::fromUtf8("\u21C4"));     // arrows: inputs/outputs to L and R
             fRoutingButton->move(6, 4);
             QObject::connect(fRoutingButton, &QToolButton::clicked, [this]() { routingMatrix(); });
             routingChanged();
@@ -1533,16 +2249,17 @@ class MetersPanel : public QWidget
             panel->fSplitter->setCollapsible(0, true);
             panel->fSplitter->setCollapsible(1, false);
             // same stretch: when the window is resized, strip and controls keep their proportions
-            panel->fWindow->setCentralWidget(panel->fSplitter);
+            // the status bar below everything
+            QWidget* central = new QWidget();
+            QVBoxLayout* column = new QVBoxLayout(central);
+            column->setContentsMargins(0, 0, 0, 0);
+            column->setSpacing(0);
+            column->addWidget(panel->fSplitter, 1);
+            panel->fStatus = new MeterStatusBar(dsp->timing(), panel->fSource.fSampleRate);
+            column->addWidget(panel->fStatus);
+            panel->fWindow->setCentralWidget(central);
             QObject::connect(panel->fSplitter, &QSplitter::splitterMoved, [panel]() { panel->saveState(); });
 
-            panel->fToggle = new QToolButton(panel->fWindow);
-            panel->fToggle->setObjectName("themeButton");          // same round style as the theme button
-            panel->fToggle->setFixedSize(22, 22);
-            panel->fToggle->setCursor(Qt::PointingHandCursor);
-            panel->fToggle->setText(QString::fromUtf8("\u223F"));  // sine wave
-            QObject::connect(panel->fToggle, &QToolButton::clicked, [panel]() { panel->setOpen(!panel->isOpen()); });
-            panel->fWindow->installEventFilter(panel);
             return panel;
         }
 
@@ -1556,16 +2273,10 @@ class MetersPanel : public QWidget
             QScreen* screen = QGuiApplication::primaryScreen();
             int maxH = screen ? screen->availableGeometry().height() - 40 : 900;
             int controls = fWindow->height();      // the window was fitted to the controls by QTGUI::run()
-            fWindow->resize(std::max(fWindow->width(), 760), std::min(controls + h + fSplitter->handleWidth(), maxH));
+            int status = fStatus ? fStatus->height() : 0;
+            fWindow->resize(std::max(fWindow->width(), 760), std::min(controls + h + fSplitter->handleWidth() + status, maxH));
             fSplitter->setSizes({ h, controls });   // rescaled by the splitter if the screen is too small
             saveState();
-            placeToggle();
-        }
-
-        bool eventFilter(QObject* obj, QEvent* event) override
-        {
-            if (obj == fWindow && event->type() == QEvent::Resize) placeToggle();
-            return QWidget::eventFilter(obj, event);
         }
 
         virtual void paintEvent(QPaintEvent*)

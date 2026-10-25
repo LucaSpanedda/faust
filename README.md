@@ -31,14 +31,28 @@ Usual build: `faust2caqt -double -midi -resample -preset auto file.dsp`
   `architecture/faust/gui/QTMeters.h`): same as `faust2caqt` (same options), plus an analysis strip
   above the controls, modelled on MiniMeters, drawn by the GPU at 60 fps with the colors of the
   light/dark theme:
-  - waveform, levels (peak, RMS Fast/Slow, LUFS Momentary/Short-Term), stereometer with
-    correlation, oscilloscope (Follow Pitch, Single/Multi cycle), spectrum (two curves, readout of
-    the loudest frequency with note and cents; FFT size follows the sample rate);
-  - everything shows two signals, L and R: a routing matrix (round button, top left) sends any
-    input or output of the DSP to L and/or R; several channels on a side are averaged;
-  - right click on a module: display options (Left/Right or Mid/Side, level mode, FFT size...);
-  - the divider below the strip resizes or closes it, the round button next to the theme button
-    closes/reopens it; when closed it costs almost nothing;
+  - waveform flowing into the oscilloscope on one time line: the history (min/max columns), a
+    lens where the time per pixel shrinks until the envelope becomes the signal, then the scope
+    (Follow Pitch, Single/Multi cycle); optional zoom of the whole module on quiet signals,
+    persistence of the scope traces and soft glow;
+  - levels (peak, RMS Fast/Slow, LUFS Momentary/Short-Term/Integrated with BS.1770 gating,
+    maximum peak in the tooltip);
+  - stereometer with L/R/mono axes, phosphor fading and correlation;
+  - spectrum (two curves, dotted peak hold, readout of the loudest frequency with note and cents;
+    FFT size follows the sample rate) or spectrogram (time scrolling as the waveform, logarithmic
+    frequency going up);
+  - everything shows two signals, L and R: a routing matrix (round button with arrows, top left;
+    the routing is in its tooltip) sends any input or output of the DSP to L and/or R; several
+    channels on a side are averaged;
+  - mode chips: moving the mouse over a module shows its main modes as small buttons
+    (L/R or M/S, 1:1 or Zoom, Scaled or Linear, Curves or Spectrogram); a click on the level bars
+    (or their readout) selects the next level mode; right click: all the options;
+  - the divider below the strip resizes it, closes it (drag up) and reopens it (drag down); when
+    closed the analysis stops and it costs almost nothing;
+  - status bar below the controls: one bar per CPU core, CPU of the whole Mac and of the
+    application (same scale), DSP load (time in the DSP compute / block duration, average and
+    worst) and late blocks, block size measured in the audio callback, sample rate, output
+    device and latency; updated once per second;
   - when the window is smaller than the interface, the controls are scaled down proportionally;
   - routing and options are saved per application.
 
