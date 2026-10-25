@@ -2104,8 +2104,101 @@ class MeterStatusBar : public QWidget
 };
 
 /**
- * The strip: the modules side by side (MiniMeters horizontal layout),
- * separated by 1 px lines, with a round button in the top left corner (same
+ * Columns of the strip: waveform + scope | levels + stereometer | spectrum,
+ * in a horizontal splitter. Dragging a border widens the module on its left
+ * and narrows the one on its right; a double click on a border restores
+ * three equal thirds. The border looks like the 1 px separators, but can be
+ * grabbed on 5 px. The proportions are kept when the window is resized and
+ * saved per application (MetersPanel).
+ */
+class MeterColumnHandle : public QSplitterHandle
+{
+
+    private:
+
+        std::function<void()> fReset;
+
+    public:
+
+        MeterColumnHandle(Qt::Orientation o, QSplitter* parent, std::function<void()> reset)
+            : QSplitterHandle(o, parent), fReset(reset)
+        {
+            setCursor(Qt::SplitHCursor);
+            setToolTip("Drag to resize the modules, double click: equal thirds");
+        }
+
+        virtual void mouseDoubleClickEvent(QMouseEvent*) { fReset(); }
+
+        virtual void paintEvent(QPaintEvent*)
+        {
+            QPainter p(this);
+            p.fillRect(rect(), FQT_METER_BG);
+            p.fillRect(QRectF(width() / 2, 0, 1, height()), FQT_BORDER);
+        }
+};
+
+class MeterColumns : public QSplitter
+{
+
+    private:
+
+        std::vector<double> fFractions { 1.0 / 3, 1.0 / 3, 1.0 / 3 };
+        std::function<void()> fChanged;
+
+    protected:
+
+        virtual QSplitterHandle* createHandle()
+        {
+            return new MeterColumnHandle(orientation(), this, [this]() { setFractions({ 1.0 / 3, 1.0 / 3, 1.0 / 3 }); fChanged(); });
+        }
+
+        virtual void resizeEvent(QResizeEvent* e)
+        {
+            QSplitter::resizeEvent(e);
+            apply();
+        }
+
+    public:
+
+        MeterColumns(std::function<void()> changed) : QSplitter(Qt::Horizontal), fChanged(changed)
+        {
+            setHandleWidth(5);
+            setChildrenCollapsible(false);
+            QObject::connect(this, &QSplitter::splitterMoved, [this]() {
+                // new proportions from the sizes chosen by the user
+                QList<int> sz = sizes();
+                double total = 0;
+                for (int v : sz) total += v;
+                if (total <= 0 || sz.size() != int(fFractions.size())) return;
+                for (int i = 0; i < sz.size(); i++) fFractions[i] = sz[i] / total;
+                fChanged();
+            });
+        }
+
+        const std::vector<double>& fractions() const { return fFractions; }
+
+        void setFractions(const std::vector<double>& f)
+        {
+            double total = 0;
+            for (double v : f) total += v;
+            if (f.size() != fFractions.size() || total <= 0) return;
+            for (size_t i = 0; i < f.size(); i++) fFractions[i] = f[i] / total;
+            apply();
+        }
+
+        void apply()
+        {
+            int total = width() - handleWidth() * (count() - 1);
+            if (total <= 0 || count() != int(fFractions.size())) return;
+            QList<int> sz;
+            for (double v : fFractions) sz << int(std::lround(v * total));
+            setSizes(sz);
+        }
+};
+
+/**
+ * The strip: the modules side by side (MiniMeters horizontal layout) in
+ * three resizable columns (MeterColumns), separated by 1 px lines, with a round button in the top left corner (same
  * style as the window buttons on the right, routing in its tooltip) that
  * opens the routing matrix. It sits in a vertical splitter above the controls: drag the divider
  * to resize it, up to close it, down to reopen it (height saved per application).
@@ -2134,6 +2227,7 @@ class MetersPanel : public QWidget
         MeterReadout* fReadout = nullptr;
         QMainWindow* fWindow = nullptr;
         QSplitter* fSplitter = nullptr;
+        MeterColumns* fColumns = nullptr;
         MeterStatusBar* fStatus = nullptr;
 
         static QSettings settings() { return QSettings("Faust", QCoreApplication::applicationName()); }
@@ -2174,28 +2268,19 @@ class MetersPanel : public QWidget
             fReadout->setText(text);
             fReadout->setHover(fLevels->underMouse() || fReadout->underMouse());
             fReadout->setToolTip(QString("%1\nClick: %2").arg(fLevels->mode()).arg(fLevels->next()));
-            QRect g = fLevels->geometry();
+            QRect g(fLevels->mapTo(this, QPoint(0, 0)), fLevels->size());
             int y = g.top() + int(fLevels->readoutY()) - fReadout->height() / 2;
             y = std::max(g.top() + 2, std::min(y, g.bottom() - fReadout->height() - 2));
             fReadout->move(g.right() + 1, y);
             fReadout->raise();
         }
 
-        void addModule(MeterModule* m, int stretch)
+        // proportions of the columns, saved as "0.333,0.333,0.333"
+        void columnsChanged()
         {
-            fModules.push_back(m);
-            static_cast<QHBoxLayout*>(layout())->addWidget(m, stretch);
-        }
-
-        // three equal thirds: waveform + scope | levels + stereometer | spectrum; the levels keep
-        // their width inside the middle third. The stretch factors follow the width of the strip
-        void fitThirds()
-        {
-            QHBoxLayout* row = static_cast<QHBoxLayout*>(layout());
-            int third = std::max(1, (width() - row->spacing() * 3) / 3);
-            row->setStretch(0, third);
-            row->setStretch(2, std::max(1, third - fLevels->width() - row->spacing()));
-            row->setStretch(3, third);
+            QStringList l;
+            for (double v : fColumns->fractions()) l << QString::number(v, 'f', 4);
+            settings().setValue("meters/columns", l.join(","));
         }
 
         bool isOpen() const { return fSplitter && fSplitter->sizes().value(0) > 0; }
@@ -2225,15 +2310,28 @@ class MetersPanel : public QWidget
 
             QHBoxLayout* row = new QHBoxLayout(this);
             row->setContentsMargins(0, 0, 0, 1);    // bottom line
-            row->setSpacing(1);                     // separators: the panel background shows through
+            row->setSpacing(0);
 
-            // order of the MiniMeters horizontal layout
-            // (the oscilloscope continues the waveform, in the same module); stretch factors: fitThirds()
-            addModule(new WaveScopeModule(fSource), 1);
+            // order of the MiniMeters horizontal layout (the oscilloscope continues the waveform, in the
+            // same module), in three resizable columns; the levels keep their width in the middle one
+            fColumns = new MeterColumns([this]() { columnsChanged(); });
+            row->addWidget(fColumns);
+            WaveScopeModule* wave = new WaveScopeModule(fSource);
             fLevels = new LevelsModule(fSource);
-            addModule(fLevels, 0);
-            addModule(new StereoModule(fSource), 1);
-            addModule(new SpectrumModule(fSource), 1);
+            StereoModule* stereo = new StereoModule(fSource);
+            SpectrumModule* spectrum = new SpectrumModule(fSource);
+            fModules = { wave, fLevels, stereo, spectrum };
+            QWidget* middle = new QWidget();
+            QHBoxLayout* pair = new QHBoxLayout(middle);
+            pair->setContentsMargins(0, 0, 0, 0);
+            pair->setSpacing(1);                    // separator: the panel background shows through
+            pair->addWidget(fLevels);
+            pair->addWidget(stereo, 1);
+            fColumns->addWidget(wave);
+            fColumns->addWidget(middle);
+            fColumns->addWidget(spectrum);
+            QStringList saved = settings().value("meters/columns").toString().split(",", Qt::SkipEmptyParts);
+            if (saved.size() == 3) fColumns->setFractions({ saved[0].toDouble(), saved[1].toDouble(), saved[2].toDouble() });
 
             fReadout = new MeterReadout(this, [this]() { fLevels->nextMode(); });
             fRoutingButton = roundButton(this, 22, QString());
@@ -2304,12 +2402,6 @@ class MetersPanel : public QWidget
             fWindow->resize(std::max(fWindow->width(), 760), std::min(controls + h + fSplitter->handleWidth() + status, maxH));
             fSplitter->setSizes({ h, controls });   // rescaled by the splitter if the screen is too small
             saveState();
-        }
-
-        virtual void resizeEvent(QResizeEvent* e)
-        {
-            fitThirds();
-            QWidget::resizeEvent(e);
         }
 
         virtual void paintEvent(QPaintEvent*)

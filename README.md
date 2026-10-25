@@ -41,7 +41,9 @@ Usual build: `faust2caqt -double -midi -resample -preset auto file.dsp`
   - spectrum (two curves, dotted peak hold, readout of the loudest frequency with note and cents;
     FFT size follows the sample rate) or spectrogram (time scrolling as the waveform, logarithmic
     frequency going up);
-  - three equal thirds: waveform + scope, levels + stereometer, spectrum;
+  - three resizable columns, equal thirds by default: waveform + scope, levels + stereometer,
+    spectrum; drag a border to widen the module on its left (only its right neighbour shrinks),
+    double click a border for equal thirds again; the proportions are saved per application;
   - everything shows two signals, L and R: a routing matrix (round button with arrows, top left;
     the routing is in its tooltip) sends any input or output of the DSP to L and/or R; several
     channels on a side are averaged;
