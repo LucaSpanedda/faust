@@ -33,14 +33,15 @@ Usual build: `faust2caqt -double -midi -resample -preset auto file.dsp`
   light/dark theme:
   - waveform flowing into the oscilloscope on one time line: the history (min/max columns), a
     lens where the time per pixel shrinks until the envelope becomes the signal, then the scope
-    (Follow Pitch, Single/Multi cycle); optional zoom of the whole module on quiet signals,
-    persistence of the scope traces and soft glow;
+    (Follow Pitch, Single/Multi cycle); the history scrolls steadily at a fixed delay from now;
+    optional zoom of the whole module on quiet signals, persistence of the scope traces, glow;
   - levels (peak, RMS Fast/Slow, LUFS Momentary/Short-Term/Integrated with BS.1770 gating,
     maximum peak in the tooltip);
   - stereometer with L/R/mono axes, phosphor fading and correlation;
   - spectrum (two curves, dotted peak hold, readout of the loudest frequency with note and cents;
     FFT size follows the sample rate) or spectrogram (time scrolling as the waveform, logarithmic
     frequency going up);
+  - three equal thirds: waveform + scope, levels + stereometer, spectrum;
   - everything shows two signals, L and R: a routing matrix (round button with arrows, top left;
     the routing is in its tooltip) sends any input or output of the DSP to L and/or R; several
     channels on a side are averaged;

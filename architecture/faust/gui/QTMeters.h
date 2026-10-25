@@ -472,21 +472,20 @@ class MeterModule : public MeterSurface
 //==============================WAVEFORM + OSCILLOSCOPE==========================
 
 /**
- * Scrolling waveform flowing into the oscilloscope, on a single time line:
+ * Scrolling waveform flowing into the oscilloscope, on a single time line,
+ * in two lanes (L and R, or Mid and Side):
  * - on the left the history, each column is the min/max of 10 ms by default;
- * - then a lens, where the time per pixel shrinks geometrically from the
- *   duration of a column to the zoom of the scope: the envelope thins into
- *   the signal itself;
+ *   it ends at a fixed delay from now, so it scrolls steadily;
+ * - then a lens, where the time per pixel shrinks geometrically down to the
+ *   zoom of the scope: the envelope thins into the signal itself;
  * - on the right the oscilloscope, starting where the lens ends.
  * With Follow Pitch the scope starts on a rising zero crossing of the first
- * lane and shows one or four periods (as the former separate scope): the
- * whole time line ends there (a few
- * milliseconds behind "now"), so the three parts stay continuous and every
- * trace passes through the junction. The older scope traces fade out
- * (persistence, off by default), the newest one has a soft glow. Zoom
- * (1:1 by default) scales the whole time line, history, lens and scope
- * together, so that the louder visible part fills 90% of the lanes (shown
- * as xN). Two lanes: L and R, or Mid and Side.
+ * lane and shows one or four periods (same trigger as before); the lens spans
+ * from the end of the history to the start of the scope, so the three parts
+ * stay continuous and every trace passes through the junction.
+ * Options: persistence of the older traces and glow (both off by default),
+ * Zoom (1:1 by default) scaling the whole module so that the louder visible
+ * part fills 90% of the lanes (shown as xN).
  */
 class WaveScopeModule : public MeterModule
 {
@@ -507,6 +506,7 @@ class WaveScopeModule : public MeterModule
         int fVersion = -1;
         uint64_t fRead = 0;                         // next sample folded into the columns
         uint64_t fColEnd = 0;                       // absolute end (excluded) of the newest column
+        uint64_t fHistEnd = 0;                      // end of the drawn history = start of the lens (fixed delay from now)
         int fPerColumn = 480;
 
         // lens: min/max per pixel, from the junction leftwards
@@ -524,7 +524,7 @@ class WaveScopeModule : public MeterModule
         int fFollow = 1;
         int fCycles = 1;
         int fPersistence = 0;
-        int fGlow = 1;
+        int fGlow = 0;
         int fAutoGain = 0;
         float fGain = 1.f;                          // zoom of the whole module (Zoom)
 
@@ -581,16 +581,31 @@ class WaveScopeModule : public MeterModule
             }
         }
 
-        // samples covered by the pixels of the lens: S[i] = samples between the junction and pixel i
-        std::vector<double> lensSpans(const Geometry& g) const
+        // samples covered by the pixels of the lens, S[i] = samples between the junction and pixel i:
+        // geometric steps starting at the zoom of the scope, scaled so that the lens spans exactly
+        // 'total' samples (from the start of the scope back to the end of the history)
+        std::vector<double> lensSpans(const Geometry& g, double total) const
         {
-            std::vector<double> s(g.lensW + 1, 0.0);
-            double scope = double(fLen) / std::max(1.f, g.scopeW);
-            double r = std::pow(std::max(1.0, fPerColumn / scope), 1.0 / g.lensW);
-            double step = scope;
-            for (int i = 0; i < g.lensW; i++) {
-                step *= r;
+            int n = g.lensW;
+            std::vector<double> s(n + 1, 0.0);
+            double a = double(fLen) / std::max(1.f, g.scopeW);
+            double r = 1.0;
+            if (total > a * n) {
+                // a * (r^n - 1) / (r - 1) = total, solved by bisection
+                auto sum = [&](double q) { return a * (std::pow(q, n) - 1.0) / (q - 1.0); };
+                double lo = 1.0 + 1e-9, hi = 4.0;
+                for (int it = 0; it < 60; it++) {
+                    double mid = 0.5 * (lo + hi);
+                    if (sum(mid) < total) lo = mid; else hi = mid;
+                }
+                r = 0.5 * (lo + hi);
+            } else {
+                a = total / n;      // short span: uniform steps
+            }
+            double step = a;
+            for (int i = 0; i < n; i++) {
                 s[i + 1] = s[i] + step;
+                step *= r;
             }
             return s;
         }
@@ -638,7 +653,7 @@ class WaveScopeModule : public MeterModule
             fFollow = option("follow", 1);
             fCycles = option("cycles", 1);
             fPersistence = std::min(int(kMaxGhosts), std::max(0, option("persistence", 0)));
-            fGlow = option("glow", 1);
+            fGlow = option("glow", 0);
             fAutoGain = option("zoom", 0);
         }
 
@@ -722,8 +737,11 @@ class WaveScopeModule : public MeterModule
                 while (int(fTraces[k].size()) > fPersistence + 1) fTraces[k].pop_back();
             }
 
-            // lens: pixel i covers [T0 - S[i+1], T0 - S[i]], the linearly interpolated signal is rasterized
-            std::vector<double> spans = lensSpans(g);
+            // lens: pixel i covers [T0 - S[i+1], T0 - S[i]], the linearly interpolated signal is rasterized.
+            // The history ends at a fixed delay from now (the oldest start of the scope), so it scrolls
+            // steadily while the start of the scope follows the trigger
+            fHistEnd = w - kWindow;
+            std::vector<double> spans = lensSpans(g, double(fT0 - fHistEnd));
             int lensSamples = int(std::ceil(spans[g.lensW])) + 2;
             uint64_t lensStart = fT0 - uint64_t(lensSamples);
             readLanes(lensStart, lensSamples + 2);
@@ -753,10 +771,8 @@ class WaveScopeModule : public MeterModule
             Geometry g = geometry();
             float lh = float(g.all.height()) / 2;
             static const char* names[2][2] = { { "L", "R" }, { "M", "S" } };
-            std::vector<double> spans = lensSpans(g);
             // newest history column that ends before the lens begins
-            int64_t lensBegin = int64_t(fT0) - int64_t(std::ceil(spans[g.lensW]));
-            int skip = int(std::max<int64_t>(0, (int64_t(fColEnd) - lensBegin + fPerColumn - 1) / fPerColumn));
+            int skip = int(std::max<int64_t>(0, (int64_t(fColEnd) - int64_t(fHistEnd) + fPerColumn - 1) / fPerColumn));
 
             for (int k = 0; k < 2; k++) {
                 float cy = float(g.all.top()) + lh * (k + 0.5f), amp = lh * 0.45f;
@@ -764,13 +780,13 @@ class WaveScopeModule : public MeterModule
                 p.setRenderHint(QPainter::Antialiasing, false);
                 p.fillRect(QRectF(g.all.left(), cy, g.all.width(), 1), FQT_TRACK);
 
-                // history and lens: one vertical line per pixel, from min to max
+                // history: one vertical line per pixel (on the pixel centers, as the lens: no gap between them)
                 fLines.clear();
                 const std::deque<Column>& cols = fCols[k];
                 int visible = int(g.xa - g.all.left());
                 for (int i = 0; i < visible && skip + i < int(cols.size()); i++) {
                     const Column& c = cols[cols.size() - 1 - skip - i];
-                    float x = g.xa - 1 - i, y0 = y(c.hi), y1 = y(c.lo);
+                    float x = g.xa - 0.5f - i, y0 = y(c.hi), y1 = y(c.lo);
                     fLines.emplace_back(x, y0, x, std::max(y1, y0 + 1));
                 }
                 p.setPen(QPen(FQT_ACCENT, 1));
@@ -793,7 +809,7 @@ class WaveScopeModule : public MeterModule
                     p.setBrush(Qt::NoBrush);
                 }
 
-                // scope: older traces fading out, then the newest with its glow
+                // scope: older traces fading out, then the newest (with its glow)
                 p.setRenderHint(QPainter::Antialiasing, true);
                 QColor c = FQT_ACCENT;
                 const std::deque<std::vector<QPointF>>& traces = fTraces[k];
@@ -2171,6 +2187,17 @@ class MetersPanel : public QWidget
             static_cast<QHBoxLayout*>(layout())->addWidget(m, stretch);
         }
 
+        // three equal thirds: waveform + scope | levels + stereometer | spectrum; the levels keep
+        // their width inside the middle third. The stretch factors follow the width of the strip
+        void fitThirds()
+        {
+            QHBoxLayout* row = static_cast<QHBoxLayout*>(layout());
+            int third = std::max(1, (width() - row->spacing() * 3) / 3);
+            row->setStretch(0, third);
+            row->setStretch(2, std::max(1, third - fLevels->width() - row->spacing()));
+            row->setStretch(3, third);
+        }
+
         bool isOpen() const { return fSplitter && fSplitter->sizes().value(0) > 0; }
 
         void saveState()
@@ -2200,13 +2227,13 @@ class MetersPanel : public QWidget
             row->setContentsMargins(0, 0, 0, 1);    // bottom line
             row->setSpacing(1);                     // separators: the panel background shows through
 
-            // order and proportions of the MiniMeters horizontal layout
-            // (the oscilloscope continues the waveform, in the same module)
-            addModule(new WaveScopeModule(fSource), 547);
+            // order of the MiniMeters horizontal layout
+            // (the oscilloscope continues the waveform, in the same module); stretch factors: fitThirds()
+            addModule(new WaveScopeModule(fSource), 1);
             fLevels = new LevelsModule(fSource);
             addModule(fLevels, 0);
-            addModule(new StereoModule(fSource), 341);
-            addModule(new SpectrumModule(fSource), 423);
+            addModule(new StereoModule(fSource), 1);
+            addModule(new SpectrumModule(fSource), 1);
 
             fReadout = new MeterReadout(this, [this]() { fLevels->nextMode(); });
             fRoutingButton = roundButton(this, 22, QString());
@@ -2277,6 +2304,12 @@ class MetersPanel : public QWidget
             fWindow->resize(std::max(fWindow->width(), 760), std::min(controls + h + fSplitter->handleWidth() + status, maxH));
             fSplitter->setSizes({ h, controls });   // rescaled by the splitter if the screen is too small
             saveState();
+        }
+
+        virtual void resizeEvent(QResizeEvent* e)
+        {
+            fitThirds();
+            QWidget::resizeEvent(e);
         }
 
         virtual void paintEvent(QPaintEvent*)
