@@ -44,6 +44,9 @@ Usual build: `faust2caqt -double -midi -resample -preset auto file.dsp`
   - three resizable columns, equal thirds by default: waveform + scope, levels + stereometer,
     spectrum; drag a border to widen the module on its left (only its right neighbour shrinks),
     double click a border for equal thirds again; the proportions are saved per application;
+    the borders are shown only while the mouse is over the strip (at rest it is one uniform
+    surface); inside the waveform + scope module the junction is a divider too (scope width,
+    double click: default);
   - everything shows two signals, L and R: a routing matrix (round button with arrows, top left;
     the routing is in its tooltip) sends any input or output of the DSP to L and/or R; several
     channels on a side are averaged;

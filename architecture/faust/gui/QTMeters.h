@@ -486,6 +486,9 @@ class MeterModule : public MeterSurface
  * Options: persistence of the older traces and glow (both off by default),
  * Zoom (1:1 by default) scaling the whole module so that the louder visible
  * part fills 90% of the lanes (shown as xN).
+ * The junction is also a divider, shown with the borders of the columns while
+ * the mouse is over the strip: drag it to give more room to the waveform or
+ * to the scope (the lens follows), double click: default width.
  */
 class WaveScopeModule : public MeterModule
 {
@@ -528,6 +531,12 @@ class WaveScopeModule : public MeterModule
         int fAutoGain = 0;
         float fGain = 1.f;                          // zoom of the whole module (Zoom)
 
+        // divider at the junction: width of the scope (fraction of the module)
+        static constexpr float kScopeDefault = 0.38f;
+        float fScopeFrac = kScopeDefault;
+        bool fShowDivider = false;
+        bool fDragging = false;
+
         std::vector<float> fBuf[2];
         std::vector<QLineF> fLines;
         std::vector<QPointF> fPoints;
@@ -558,8 +567,9 @@ class WaveScopeModule : public MeterModule
             Geometry g;
             g.all = QRectF(rect()).adjusted(2, 30, -2, -4);     // below the routing button
             float w = float(g.all.width());
-            g.scopeW = std::floor(w * 0.38f);
             g.lensW = int(std::max(16.f, w * 0.16f));
+            // the history keeps at least 20 px
+            g.scopeW = std::floor(std::max(20.f, std::min(w * fScopeFrac, w - g.lensW - 20.f)));
             g.xj = float(g.all.right()) - g.scopeW;
             g.xa = g.xj - g.lensW;
             return g;
@@ -655,6 +665,50 @@ class WaveScopeModule : public MeterModule
             fPersistence = std::min(int(kMaxGhosts), std::max(0, option("persistence", 0)));
             fGlow = option("glow", 0);
             fAutoGain = option("zoom", 0);
+            fScopeFrac = std::min(0.75f, std::max(0.12f, option("scope", int(kScopeDefault * 1000)) / 1000.f));
+            setMouseTracking(true);     // resize cursor over the divider
+        }
+
+        void setShowDivider(bool show)
+        {
+            if (show == fShowDivider) return;
+            fShowDivider = show;
+            if (!show && !fDragging) unsetCursor();
+            update();
+        }
+
+        bool nearDivider(const QPointF& pos) const { return fShowDivider && std::fabs(pos.x() - geometry().xj) <= 4; }
+
+        virtual void mousePressEvent(QMouseEvent* e)
+        {
+            if (e->button() == Qt::LeftButton && nearDivider(e->position())) { fDragging = true; return; }
+            MeterModule::mousePressEvent(e);
+        }
+
+        virtual void mouseMoveEvent(QMouseEvent* e)
+        {
+            if (fDragging) {
+                QRectF all = geometry().all;
+                fScopeFrac = std::min(0.75f, std::max(0.12f, float((all.right() - e->position().x()) / all.width())));
+                update();
+                return;
+            }
+            if (nearDivider(e->position())) setCursor(Qt::SplitHCursor); else unsetCursor();
+        }
+
+        virtual void mouseReleaseEvent(QMouseEvent*)
+        {
+            if (!fDragging) return;
+            fDragging = false;
+            setOption("scope", int(std::lround(fScopeFrac * 1000)));
+        }
+
+        virtual void mouseDoubleClickEvent(QMouseEvent* e)
+        {
+            if (!nearDivider(e->position())) return;
+            fScopeFrac = kScopeDefault;
+            setOption("scope", int(std::lround(fScopeFrac * 1000)));
+            update();
         }
 
         virtual void tick()
@@ -771,6 +825,8 @@ class WaveScopeModule : public MeterModule
             Geometry g = geometry();
             float lh = float(g.all.height()) / 2;
             static const char* names[2][2] = { { "L", "R" }, { "M", "S" } };
+            // divider at the junction, under the traces (mouse over the strip)
+            if (fShowDivider || fDragging) p.fillRect(QRectF(std::floor(g.xj), 0, 1, height()), FQT_BORDER);
             // newest history column that ends before the lens begins
             int skip = int(std::max<int64_t>(0, (int64_t(fColEnd) - int64_t(fHistEnd) + fPerColumn - 1) / fPerColumn));
 
@@ -2107,7 +2163,8 @@ class MeterStatusBar : public QWidget
  * Columns of the strip: waveform + scope | levels + stereometer | spectrum,
  * in a horizontal splitter. Dragging a border widens the module on its left
  * and narrows the one on its right; a double click on a border restores
- * three equal thirds. The border looks like the 1 px separators, but can be
+ * three equal thirds. The border is a 1 px line, shown only while the mouse
+ * is over the strip (at rest the strip is one uniform surface), and can be
  * grabbed on 5 px. The proportions are kept when the window is resized and
  * saved per application (MetersPanel).
  */
@@ -2117,11 +2174,12 @@ class MeterColumnHandle : public QSplitterHandle
     private:
 
         std::function<void()> fReset;
+        const bool* fShow;      // line visible (mouse over the strip)
 
     public:
 
-        MeterColumnHandle(Qt::Orientation o, QSplitter* parent, std::function<void()> reset)
-            : QSplitterHandle(o, parent), fReset(reset)
+        MeterColumnHandle(Qt::Orientation o, QSplitter* parent, std::function<void()> reset, const bool* show)
+            : QSplitterHandle(o, parent), fReset(reset), fShow(show)
         {
             setCursor(Qt::SplitHCursor);
             setToolTip("Drag to resize the modules, double click: equal thirds");
@@ -2133,7 +2191,7 @@ class MeterColumnHandle : public QSplitterHandle
         {
             QPainter p(this);
             p.fillRect(rect(), FQT_METER_BG);
-            p.fillRect(QRectF(width() / 2, 0, 1, height()), FQT_BORDER);
+            if (*fShow) p.fillRect(QRectF(width() / 2, 0, 1, height()), FQT_BORDER);
         }
 };
 
@@ -2144,12 +2202,13 @@ class MeterColumns : public QSplitter
 
         std::vector<double> fFractions { 1.0 / 3, 1.0 / 3, 1.0 / 3 };
         std::function<void()> fChanged;
+        bool fShowLines = false;
 
     protected:
 
         virtual QSplitterHandle* createHandle()
         {
-            return new MeterColumnHandle(orientation(), this, [this]() { setFractions({ 1.0 / 3, 1.0 / 3, 1.0 / 3 }); fChanged(); });
+            return new MeterColumnHandle(orientation(), this, [this]() { setFractions({ 1.0 / 3, 1.0 / 3, 1.0 / 3 }); fChanged(); }, &fShowLines);
         }
 
         virtual void resizeEvent(QResizeEvent* e)
@@ -2176,6 +2235,12 @@ class MeterColumns : public QSplitter
         }
 
         const std::vector<double>& fractions() const { return fFractions; }
+
+        void setShowLines(bool show)
+        {
+            fShowLines = show;
+            for (int i = 1; i < count(); i++) handle(i)->update();
+        }
 
         void setFractions(const std::vector<double>& f)
         {
@@ -2228,6 +2293,8 @@ class MetersPanel : public QWidget
         QMainWindow* fWindow = nullptr;
         QSplitter* fSplitter = nullptr;
         MeterColumns* fColumns = nullptr;
+        WaveScopeModule* fWave = nullptr;
+        bool fStripHover = false;           // mouse over the strip: borders shown
         MeterStatusBar* fStatus = nullptr;
 
         static QSettings settings() { return QSettings("Faust", QCoreApplication::applicationName()); }
@@ -2316,7 +2383,7 @@ class MetersPanel : public QWidget
             // same module), in three resizable columns; the levels keep their width in the middle one
             fColumns = new MeterColumns([this]() { columnsChanged(); });
             row->addWidget(fColumns);
-            WaveScopeModule* wave = new WaveScopeModule(fSource);
+            WaveScopeModule* wave = fWave = new WaveScopeModule(fSource);
             fLevels = new LevelsModule(fSource);
             StereoModule* stereo = new StereoModule(fSource);
             SpectrumModule* spectrum = new SpectrumModule(fSource);
@@ -2344,6 +2411,14 @@ class MetersPanel : public QWidget
                 if (!isVisible() || (fSplitter && !isOpen())) return;     // closed strip: no analysis
                 for (MeterModule* m : fModules) m->tick();
                 placeReadout();
+                // borders of the modules: shown only while the mouse is over the strip
+                bool hover = underMouse();
+                if (hover != fStripHover) {
+                    fStripHover = hover;
+                    fColumns->setShowLines(hover);
+                    fWave->setShowDivider(hover);
+                    update();
+                }
             });
             fTimer.start(kMeterFrameMs);
         }
@@ -2406,9 +2481,11 @@ class MetersPanel : public QWidget
 
         virtual void paintEvent(QPaintEvent*)
         {
-            // separators between the modules and bottom line
+            // separator between the levels and the stereometer (shown with the borders of the
+            // columns, otherwise the background of the modules) and bottom line
             QPainter p(this);
-            p.fillRect(rect(), FQT_BORDER);
+            p.fillRect(rect(), fStripHover ? FQT_BORDER : FQT_METER_BG);
+            p.fillRect(QRectF(0, height() - 1, width(), 1), FQT_BORDER);
         }
 };
 
