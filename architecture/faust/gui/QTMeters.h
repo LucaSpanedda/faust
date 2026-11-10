@@ -1,11 +1,14 @@
 /************************** BEGIN QTMeters.h **************************
- Analysis strip for the Faust QT applications (Luca Spanedda), modelled on
- MiniMeters: waveform flowing into the oscilloscope, levels/loudness,
- stereometer and spectrum (or spectrogram), above the controls of the QTGUI
- window, and a status bar below them (CPU per core, DSP load, block size).
+ Meters for the Faust QT applications (Luca Spanedda), modelled on MiniMeters:
+ waveform, levels/loudness, stereometer, oscilloscope and spectrum (or
+ spectrogram) in a floating window shown by a round button of the QTGUI
+ window, and a status bar below the controls (CPU per core, DSP load, block
+ size, channels). On macOS both windows have a title bar on demand: contents
+ under it, close / minimize / zoom buttons only while the mouse is over the
+ top band.
 
- Everything shows two signals, L and R. A routing matrix (round button in the
- top left corner of the strip) decides which inputs and outputs of the DSP
+ Everything shows two signals, L and R. A routing matrix (gear button in the
+ top left corner of the meters) decides which inputs and outputs of the DSP
  go to L and to R; several channels on the same side are averaged.
 
  - MeterDSP wraps the DSP and copies its input and output buffers into
@@ -56,6 +59,8 @@
 #include <QTimer>
 #include <QToolButton>
 #include <QVBoxLayout>
+#include <QWindow>
+#include <QCursor>
 
 #include "faust/dsp/dsp.h"
 
@@ -317,6 +322,86 @@ static inline QPen fqtLinePen(const QColor& color, double width = 2.0)
 }
 #define FQT_CLIP        QColor(0xe0, 0x30, 0x20)        // peak hold at 0 dBFS
 
+//==============================TITLE BAR=====================================
+
+/**
+ * Title bar on demand (macOS, Qt >= 6.9): the contents of both windows extend
+ * under the title bar, the title is hidden and the close / minimize / zoom
+ * buttons appear only while the mouse is over the top band of the window.
+ * The windows are moved by dragging an empty part of that band (the meters:
+ * any part of a module that is not a control).
+ */
+#if defined(__APPLE__) && QT_VERSION >= QT_VERSION_CHECK(6, 9, 0)
+#define FQT_TITLE_ON_HOVER 1
+#else
+#define FQT_TITLE_ON_HOVER 0
+#endif
+
+static const int kTitleBand = 28;   // height of the macOS title bar, where its buttons sit
+static const int kGearX = FQT_TITLE_ON_HOVER ? 74 : 6;     // routing button, right of the title bar buttons
+
+// before the window is shown: contents under a transparent title bar
+static inline void fqtExpandTitleBar(QWidget* w)
+{
+#if FQT_TITLE_ON_HOVER
+    w->setWindowFlag(Qt::ExpandedClientAreaHint, true);
+    w->setWindowFlag(Qt::NoTitleBarBackgroundHint, true);
+    w->setAttribute(Qt::WA_ContentsMarginsRespectsSafeArea, false);
+#else
+    (void)w;
+#endif
+}
+
+// the Objective-C runtime, declared here: its headers clash with others in the application
+#if FQT_TITLE_ON_HOVER
+extern "C" void* sel_registerName(const char* name);
+extern "C" void objc_msgSend(void);
+
+static inline void* fqtSend(void* obj, const char* sel)
+{
+    return ((void* (*)(void*, void*))objc_msgSend)(obj, sel_registerName(sel));
+}
+
+static inline void* fqtSend(void* obj, const char* sel, long arg)
+{
+    return ((void* (*)(void*, void*, long))objc_msgSend)(obj, sel_registerName(sel), arg);
+}
+
+// the NSWindow of a shown top level widget (null before it is shown)
+static inline void* fqtNSWindow(QWidget* w)
+{
+    if (!w->windowHandle()) return nullptr;
+    void* view = (void*)w->winId();
+    return view ? fqtSend(view, "window") : nullptr;
+}
+#endif
+
+// show or hide the close / minimize / zoom buttons (the title text stays hidden)
+static inline void fqtTitleButtons(QWidget* w, bool show)
+{
+#if FQT_TITLE_ON_HOVER
+    void* win = fqtNSWindow(w);
+    if (!win) return;
+    fqtSend(win, "setTitleVisibility:", 1);     // NSWindowTitleHidden
+    for (long i = 0; i < 3; i++) {              // NSWindowCloseButton, NSWindowMiniaturizeButton, NSWindowZoomButton
+        void* b = fqtSend(win, "standardWindowButton:", i);
+        if (b) ((void (*)(void*, void*, bool))objc_msgSend)(b, sel_registerName("setHidden:"), !show);
+    }
+#else
+    (void)w; (void)show;
+#endif
+}
+
+// drag the window from a press that no control took
+static inline void fqtStartMove(QWidget* w)
+{
+#if FQT_TITLE_ON_HOVER
+    if (QWindow* h = w->window()->windowHandle()) h->startSystemMove();
+#else
+    (void)w;
+#endif
+}
+
 #ifdef FQT_METERS_NO_GL
 typedef QWidget MeterSurface;
 static const int kMeterFrameMs = 40;    // 25 fps
@@ -452,6 +537,7 @@ class MeterModule : public MeterSurface
                     return;
                 }
             }
+            fqtStartMove(this);     // not on a chip: move the window
         }
 
         virtual void tick() = 0;    // read the ring and analyse (GUI thread, once per frame)
@@ -469,246 +555,60 @@ class MeterModule : public MeterSurface
         }
 };
 
-//==============================WAVEFORM + OSCILLOSCOPE==========================
+//==============================WAVEFORM=====================================
 
 /**
- * Scrolling waveform flowing into the oscilloscope, on a single time line,
- * in two lanes (L and R, or Mid and Side):
- * - on the left the history, each column is the min/max of 10 ms by default;
- *   it ends at a fixed delay from now, so it scrolls steadily;
- * - then a lens, where the time per pixel shrinks geometrically down to the
- *   zoom of the scope: the envelope thins into the signal itself;
- * - on the right the oscilloscope, starting where the lens ends.
- * With Follow Pitch the scope starts on a rising zero crossing of the first
- * lane and shows one or four periods (same trigger as before); the lens spans
- * from the end of the history to the start of the scope, so the three parts
- * stay continuous and every trace passes through the junction.
- * Options: persistence of the older traces and glow (both off by default),
- * Zoom (1:1 by default) scaling the whole module so that the louder visible
- * part fills 90% of the lanes (shown as xN).
- * The junction is also a divider, shown with the borders of the columns while
- * the mouse is over the strip: drag it to give more room to the waveform or
- * to the scope (the lens follows), double click: default width.
+ * Scrolling waveform of L and R (or Mid and Side) in two lanes, as in
+ * MiniMeters: each column is the min/max of 10 ms by default, the newest on
+ * the right. Smooth scrolling: the time shown follows the wall clock between
+ * two audio blocks (kept a little behind the audio, gently corrected), and
+ * the history is drawn as a filled antialiased envelope at fractional pixel
+ * positions, so it moves by the same small amount at every frame instead of
+ * jumping by whole pixels.
  */
-class WaveScopeModule : public MeterModule
+class WaveformModule : public MeterModule
 {
 
     private:
 
         static const int kColumns = 4000;           // history columns (wide windows at 10 ms)
-        static const int kWindow = 16384;           // samples searched by the trigger
-        static const int kMaxGhosts = 16;
-
         struct Column { float lo, hi; };
-        struct Geometry { QRectF all; float xa, xj, scopeW; int lensW; };
-
-        // history
         std::deque<Column> fCols[2];
         float fLo[2] = { 0.f, 0.f }, fHi[2] = { 0.f, 0.f };
         int fCount = 0;
         int fVersion = -1;
         uint64_t fRead = 0;                         // next sample folded into the columns
         uint64_t fColEnd = 0;                       // absolute end (excluded) of the newest column
-        uint64_t fHistEnd = 0;                      // end of the drawn history = start of the lens (fixed delay from now)
         int fPerColumn = 480;
-
-        // lens: min/max per pixel, from the junction leftwards
-        std::vector<Column> fLens[2];
-
-        // scope: start and length of the trace, older traces (u 0..1, v -1..1)
-        uint64_t fT0 = 0;
-        int fLen = 2048;
-        float fFreq = 0.f;
-        std::deque<std::vector<QPointF>> fTraces[2];
-
-        // options
+        double fPos = 0.0;                          // time shown at the right edge, in samples
+        std::chrono::steady_clock::time_point fLast;
         int fSpeed = 1;
         int fMidSide = 0;
-        int fFollow = 1;
-        int fCycles = 1;
-        int fPersistence = 0;
-        int fGlow = 0;
-        int fAutoGain = 0;
-        float fGain = 1.f;                          // zoom of the whole module (Zoom)
-
-        // divider at the junction: width of the scope (fraction of the module)
-        static constexpr float kScopeDefault = 0.38f;
-        float fScopeFrac = kScopeDefault;
-        bool fShowDivider = false;
-        bool fDragging = false;
-
-        std::vector<float> fBuf[2];
-        std::vector<QLineF> fLines;
-        std::vector<QPointF> fPoints;
+        std::vector<float> fIn[2];
+        QPolygonF fShape;
 
         virtual void fillMenu(QMenu* menu)
         {
             addChoice(menu, "Display", "midside", fMidSide, { "Left / Right", "Mid / Side" }, { 0, 1 });
-            addChoice(menu, "History", "speed", fSpeed, { "Slow (40 ms / pixel)", "Normal (10 ms / pixel)", "Fast (2.5 ms / pixel)" }, { 0, 1, 2 });
-            addChoice(menu, "Follow Pitch", "follow", fFollow, { "On", "Off" }, { 1, 0 });
-            addChoice(menu, "Cycle", "cycles", fCycles, { "Single", "Multi" }, { 1, 4 });
-            addChoice(menu, "Persistence", "persistence", fPersistence, { "Off", "Short", "Long" }, { 0, 6, kMaxGhosts });
-            addChoice(menu, "Glow", "glow", fGlow, { "On", "Off" }, { 1, 0 });
-            addChoice(menu, "Scale", "zoom", fAutoGain, { "1:1", "Zoom (on quiet signals)" }, { 0, 1 });
+            addChoice(menu, "Speed", "speed", fSpeed, { "Slow (40 ms / pixel)", "Normal (10 ms / pixel)", "Fast (2.5 ms / pixel)" }, { 0, 1, 2 });
         }
-
-        virtual void optionsChanged() { fVersion = -1; }   // restart the history
 
         virtual std::vector<ChipGroup> chipGroups()
         {
-            return { { "midside", &fMidSide, { "L/R", "M/S" }, { 0, 1 } },
-                     { "zoom", &fAutoGain, { "1:1", "Zoom" }, { 0, 1 } } };
+            return { { "midside", &fMidSide, { "L/R", "M/S" }, { 0, 1 } } };
         }
 
-        virtual QPointF chipOrigin() const { return QPointF(34, 8); }     // right of the routing button
+        virtual QPointF chipOrigin() const { return QPointF(kGearX + 28, 8); }     // right of the routing button
 
-        Geometry geometry() const
-        {
-            Geometry g;
-            g.all = QRectF(rect()).adjusted(2, 30, -2, -4);     // below the routing button
-            float w = float(g.all.width());
-            g.lensW = int(std::max(16.f, w * 0.16f));
-            // the history keeps at least 20 px
-            g.scopeW = std::floor(std::max(20.f, std::min(w * fScopeFrac, w - g.lensW - 20.f)));
-            g.xj = float(g.all.right()) - g.scopeW;
-            g.xa = g.xj - g.lensW;
-            return g;
-        }
-
-        // 'n' samples of both lanes (L/R or M/S) from absolute position 'start'
-        void readLanes(uint64_t start, int n)
-        {
-            for (int k = 0; k < 2; k++) {
-                fBuf[k].resize(std::max(n, 1));
-                fSource.readSide(k, start, fBuf[k].data(), n);
-            }
-            if (fMidSide) {
-                for (int i = 0; i < n; i++) {
-                    float l = fBuf[0][i], r = fBuf[1][i];
-                    fBuf[0][i] = 0.5f * (l + r);
-                    fBuf[1][i] = 0.5f * (l - r);
-                }
-            }
-        }
-
-        // samples covered by the pixels of the lens, S[i] = samples between the junction and pixel i:
-        // geometric steps starting at the zoom of the scope, scaled so that the lens spans exactly
-        // 'total' samples (from the start of the scope back to the end of the history)
-        std::vector<double> lensSpans(const Geometry& g, double total) const
-        {
-            int n = g.lensW;
-            std::vector<double> s(n + 1, 0.0);
-            double a = double(fLen) / std::max(1.f, g.scopeW);
-            double r = 1.0;
-            if (total > a * n) {
-                // a * (r^n - 1) / (r - 1) = total, solved by bisection
-                auto sum = [&](double q) { return a * (std::pow(q, n) - 1.0) / (q - 1.0); };
-                double lo = 1.0 + 1e-9, hi = 4.0;
-                for (int it = 0; it < 60; it++) {
-                    double mid = 0.5 * (lo + hi);
-                    if (sum(mid) < total) lo = mid; else hi = mid;
-                }
-                r = 0.5 * (lo + hi);
-            } else {
-                a = total / n;      // short span: uniform steps
-            }
-            double step = a;
-            for (int i = 0; i < n; i++) {
-                s[i + 1] = s[i] + step;
-                step *= r;
-            }
-            return s;
-        }
-
-        // trace of lane 'k' (fBuf, from 'offset'), at most two points per pixel
-        std::vector<QPointF> trace(int k, int offset, int pixels) const
-        {
-            std::vector<QPointF> pts;
-            const float* x = fBuf[k].data() + offset;
-            float gain = fGain;
-            auto v = [gain](float s) { return std::min(1.f, std::max(-1.f, s * gain)); };
-            if (fLen <= 2 * pixels) {
-                for (int i = 0; i < fLen; i++) pts.emplace_back(double(i) / (fLen - 1), v(x[i]));
-                return pts;
-            }
-            // min and max of each pixel, in the order they occur
-            for (int p = 0; p < pixels; p++) {
-                int i0 = int(int64_t(p) * fLen / pixels), i1 = std::max(i0 + 1, int(int64_t(p + 1) * fLen / pixels));
-                int imin = i0, imax = i0;
-                for (int i = i0; i < i1; i++) {
-                    if (x[i] < x[imin]) imin = i;
-                    if (x[i] > x[imax]) imax = i;
-                }
-                int a = std::min(imin, imax), b = std::max(imin, imax);
-                pts.emplace_back(double(a) / (fLen - 1), v(x[a]));
-                if (b != a) pts.emplace_back(double(b) / (fLen - 1), v(x[b]));
-            }
-            return pts;
-        }
-
-        void paintTrace(QPainter& p, const std::vector<QPointF>& t, const Geometry& g, float cy, float amp)
-        {
-            fPoints.clear();
-            for (const QPointF& pt : t) fPoints.emplace_back(g.xj + pt.x() * g.scopeW, cy - pt.y() * amp);
-            p.drawPolyline(fPoints.data(), int(fPoints.size()));
-        }
+        virtual void optionsChanged() { fVersion = -1; }   // restart the history
 
     public:
 
-        WaveScopeModule(const MeterSource& src) : MeterModule(src, "wavescope")
+        WaveformModule(const MeterSource& src) : MeterModule(src, "waveform")
         {
-            setMinimumWidth(160);
+            setMinimumWidth(80);
             fSpeed = option("speed", 1);
             fMidSide = option("midside", 0);
-            fFollow = option("follow", 1);
-            fCycles = option("cycles", 1);
-            fPersistence = std::min(int(kMaxGhosts), std::max(0, option("persistence", 0)));
-            fGlow = option("glow", 0);
-            fAutoGain = option("zoom", 0);
-            fScopeFrac = std::min(0.75f, std::max(0.12f, option("scope", int(kScopeDefault * 1000)) / 1000.f));
-            setMouseTracking(true);     // resize cursor over the divider
-        }
-
-        void setShowDivider(bool show)
-        {
-            if (show == fShowDivider) return;
-            fShowDivider = show;
-            if (!show && !fDragging) unsetCursor();
-            update();
-        }
-
-        bool nearDivider(const QPointF& pos) const { return fShowDivider && std::fabs(pos.x() - geometry().xj) <= 4; }
-
-        virtual void mousePressEvent(QMouseEvent* e)
-        {
-            if (e->button() == Qt::LeftButton && nearDivider(e->position())) { fDragging = true; return; }
-            MeterModule::mousePressEvent(e);
-        }
-
-        virtual void mouseMoveEvent(QMouseEvent* e)
-        {
-            if (fDragging) {
-                QRectF all = geometry().all;
-                fScopeFrac = std::min(0.75f, std::max(0.12f, float((all.right() - e->position().x()) / all.width())));
-                update();
-                return;
-            }
-            if (nearDivider(e->position())) setCursor(Qt::SplitHCursor); else unsetCursor();
-        }
-
-        virtual void mouseReleaseEvent(QMouseEvent*)
-        {
-            if (!fDragging) return;
-            fDragging = false;
-            setOption("scope", int(std::lround(fScopeFrac * 1000)));
-        }
-
-        virtual void mouseDoubleClickEvent(QMouseEvent* e)
-        {
-            if (!nearDivider(e->position())) return;
-            fScopeFrac = kScopeDefault;
-            setOption("scope", int(std::lround(fScopeFrac * 1000)));
-            update();
         }
 
         virtual void tick()
@@ -716,24 +616,31 @@ class WaveScopeModule : public MeterModule
             uint64_t w = fSource.clock();
             static const int tenthsOfMs[] = { 400, 100, 25 };   // duration of a column
             fPerColumn = std::max(1, fSource.fSampleRate * tenthsOfMs[fSpeed] / 10000);
+            auto now = std::chrono::steady_clock::now();
             if (fVersion != fSource.fVersion) {
                 // new routing or options: restart the history
                 fVersion = fSource.fVersion;
                 fRead = fColEnd = w;
                 fCount = 0;
-                for (int k = 0; k < 2; k++) { fCols[k].clear(); fTraces[k].clear(); }
+                fPos = double(w);
+                for (int k = 0; k < 2; k++) fCols[k].clear();
             }
 
-            // history: fold the new samples into columns
+            // fold the new samples into columns
             int n = int(std::min<uint64_t>(w - fRead, MeterRing::kSize / 2));
             uint64_t start = w - n;
-            readLanes(start, n);
+            for (int k = 0; k < 2; k++) {
+                fIn[k].resize(std::max(n, 1));
+                fSource.readSide(k, start, fIn[k].data(), n);
+            }
             for (int i = 0; i < n; i++) {
+                float l = fIn[0][i], r = fIn[1][i];
+                float v[2] = { l, r };
+                if (fMidSide) { v[0] = 0.5f * (l + r); v[1] = 0.5f * (l - r); }
                 for (int k = 0; k < 2; k++) {
-                    float v = fBuf[k][i];
-                    if (fCount == 0) fLo[k] = fHi[k] = v;
-                    fLo[k] = std::min(fLo[k], v);
-                    fHi[k] = std::max(fHi[k], v);
+                    if (fCount == 0) fLo[k] = fHi[k] = v[k];
+                    fLo[k] = std::min(fLo[k], v[k]);
+                    fHi[k] = std::max(fHi[k], v[k]);
                 }
                 if (++fCount == fPerColumn) {
                     for (int k = 0; k < 2; k++) {
@@ -746,74 +653,185 @@ class WaveScopeModule : public MeterModule
             }
             fRead = w;
 
-            // scope: rising zero crossings of the first lane with a small hysteresis, searched backwards
-            uint64_t winStart = w - kWindow;
-            readLanes(winStart, kWindow);
-            int len = 2048, s = kWindow - len;
+            // time shown: advances with the wall clock, pulled softly toward the audio clock
+            // (two columns behind it, so that the newest column is always complete)
+            double dt = std::chrono::duration<double>(now - fLast).count();
+            fLast = now;
+            double target = double(w) - 2.0 * fPerColumn;
+            fPos += std::min(dt, 0.1) * fSource.fSampleRate;
+            if (std::fabs(target - fPos) > 0.25 * fSource.fSampleRate) fPos = target;     // resync (pause, routing)
+            else fPos += (target - fPos) * 0.05;
+            fPos = std::min(fPos, double(fColEnd));
+            update();
+        }
+
+        virtual void paintGL()
+        {
+            QPainter p(this);
+            paintBackground(p);
+            QRectF all = QRectF(rect()).adjusted(2, 30, -2, -4);     // below the routing button
+            float lh = float(all.height()) / 2;
+            static const char* names[2][2] = { { "L", "R" }, { "M", "S" } };
+            // right edge of the newest column, in pixels from the right border (fractional)
+            double offset = (fPos - double(fColEnd)) / fPerColumn;
+            p.setFont(fqtMeterFont(8));
+            for (int k = 0; k < 2; k++) {
+                float cy = float(all.top()) + lh * (k + 0.5f), amp = lh * 0.45f;
+                p.setRenderHint(QPainter::Antialiasing, false);
+                p.fillRect(QRectF(all.left(), cy, all.width(), 1), FQT_TRACK);
+
+                // envelope: upper edge left to right, then lower edge back
+                const std::deque<Column>& cols = fCols[k];
+                int n = std::min(int(cols.size()), int(all.width() - offset) + 2);
+                if (n > 1) {
+                    fShape.resize(2 * n);
+                    for (int i = 0; i < n; i++) {
+                        const Column& c = cols[cols.size() - 1 - i];
+                        float x = float(all.right() - offset - i - 0.5);
+                        float y0 = cy - std::min(1.f, std::max(-1.f, c.hi)) * amp, y1 = cy - std::min(1.f, std::max(-1.f, c.lo)) * amp;
+                        float pad = std::max(0.f, 1.f - (y1 - y0)) / 2;      // at least 1 px thick where the signal is flat
+                        fShape[n - 1 - i] = QPointF(x, y0 - pad);
+                        fShape[n + i] = QPointF(x, y1 + pad);
+                    }
+                    p.save();
+                    p.setClipRect(all);
+                    p.setRenderHint(QPainter::Antialiasing, true);
+                    p.setPen(Qt::NoPen);
+                    p.setBrush(FQT_ACCENT);
+                    p.drawPolygon(fShape);
+                    p.restore();
+                }
+                p.setPen(FQT_TEXT_DIM);
+                p.drawText(QRectF(all.left() + 2, cy - lh / 2, 20, lh), Qt::AlignLeft | Qt::AlignVCenter, names[fMidSide][k]);
+            }
+            paintChips(p);
+        }
+};
+
+//==============================OSCILLOSCOPE=====================================
+
+/**
+ * Oscilloscope of L (accent color) and R (dimmed) overlaid, full height, as
+ * in MiniMeters. Follow Pitch: the trace starts on a rising zero crossing of
+ * L and its length follows the period (Single: one cycle, Multi: four
+ * cycles); otherwise the last 2048 samples, free running. Options: Zoom
+ * (1:1 by default, xN on quiet signals), persistence of the older traces and
+ * glow (both off by default); the period followed is shown at the bottom.
+ */
+class ScopeModule : public MeterModule
+{
+
+    private:
+
+        static const int kWindow = 16384;
+        static const int kMaxGhosts = 16;
+        std::vector<float> fBuffer, fBuffer2;
+        std::deque<std::vector<QPointF>> fTraces[2];      // newest first, u 0..1, v -1..1
+        int fLen = 2048;
+        float fFreq = 0.f, fGain = 1.f;
+        int fFollow = 1;
+        int fCycles = 1;
+        int fAutoGain = 0;
+        int fPersistence = 0;
+        int fGlow = 0;
+        std::vector<QPointF> fPoints;
+
+        // trace of one buffer from 'start', at most two points per pixel (min and max, in order)
+        std::vector<QPointF> trace(const std::vector<float>& b, int start, int pixels) const
+        {
+            std::vector<QPointF> pts;
+            const float* x = b.data() + start;
+            float gain = fGain;
+            auto v = [gain](float s) { return std::min(1.f, std::max(-1.f, s * gain)); };
+            if (fLen <= 2 * pixels) {
+                for (int i = 0; i < fLen; i++) pts.emplace_back(double(i) / (fLen - 1), v(x[i]));
+                return pts;
+            }
+            for (int p = 0; p < pixels; p++) {
+                int i0 = int(int64_t(p) * fLen / pixels), i1 = std::max(i0 + 1, int(int64_t(p + 1) * fLen / pixels));
+                int imin = i0, imax = i0;
+                for (int i = i0; i < i1; i++) {
+                    if (x[i] < x[imin]) imin = i;
+                    if (x[i] > x[imax]) imax = i;
+                }
+                int a = std::min(imin, imax), c = std::max(imin, imax);
+                pts.emplace_back(double(a) / (fLen - 1), v(x[a]));
+                if (c != a) pts.emplace_back(double(c) / (fLen - 1), v(x[c]));
+            }
+            return pts;
+        }
+
+        void paintTrace(QPainter& p, const std::vector<QPointF>& t, const QRectF& r)
+        {
+            fPoints.clear();
+            for (const QPointF& pt : t) fPoints.emplace_back(r.left() + pt.x() * r.width(), r.center().y() - pt.y() * r.height() / 2);
+            p.drawPolyline(fPoints.data(), int(fPoints.size()));
+        }
+
+        virtual void fillMenu(QMenu* menu)
+        {
+            addChoice(menu, "Follow Pitch", "follow", fFollow, { "On", "Off" }, { 1, 0 });
+            addChoice(menu, "Cycle", "cycles", fCycles, { "Single", "Multi" }, { 1, 4 });
+            addChoice(menu, "Scale", "zoom", fAutoGain, { "1:1", "Zoom (on quiet signals)" }, { 0, 1 });
+            addChoice(menu, "Persistence", "persistence", fPersistence, { "Off", "Short", "Long" }, { 0, 6, kMaxGhosts });
+            addChoice(menu, "Glow", "glow", fGlow, { "On", "Off" }, { 1, 0 });
+        }
+
+        virtual std::vector<ChipGroup> chipGroups()
+        {
+            return { { "cycles", &fCycles, { "1", "4" }, { 1, 4 } },
+                     { "zoom", &fAutoGain, { "1:1", "Zoom" }, { 0, 1 } } };
+        }
+
+    public:
+
+        ScopeModule(const MeterSource& src) : MeterModule(src, "scope")
+        {
+            setMinimumWidth(50);
+            fFollow = option("follow", 1);
+            fCycles = option("cycles", 1) == 4 ? 4 : 1;
+            fAutoGain = option("zoom", 0);
+            fPersistence = std::min(int(kMaxGhosts), std::max(0, option("persistence", 0)));
+            fGlow = option("glow", 0);
+        }
+
+        virtual void tick()
+        {
+            fBuffer.resize(kWindow);
+            fBuffer2.resize(kWindow);
+            fSource.readPair(fBuffer.data(), fBuffer2.data(), kWindow);
+            int len = 2048, start = kWindow - len;
             fFreq = 0.f;
             if (fFollow) {
+                // rising zero crossings with a small hysteresis, searched backwards
                 std::vector<int> ups;
                 bool below = false;
-                const std::vector<float>& b = fBuf[0];
                 for (int i = kWindow - 1; i > 0 && int(ups.size()) <= fCycles + 1; i--) {
-                    if (b[i] < -1e-4f) below = true;
-                    if (below && b[i - 1] <= 0.f && b[i] > 0.f) { ups.push_back(i); below = false; }
+                    if (fBuffer[i] < -1e-4f) below = true;
+                    if (below && fBuffer[i - 1] <= 0.f && fBuffer[i] > 0.f) { ups.push_back(i); below = false; }
                 }
                 if (int(ups.size()) > fCycles + 1) {
                     int period = ups[0] - ups[1];
                     len = std::min(std::max(fCycles * period, 32), kWindow / 2);
-                    s = ups[fCycles + 1];
-                    if (s + len > kWindow) s = kWindow - len;
+                    start = ups[fCycles + 1];
+                    if (start + len > kWindow) start = kWindow - len;
                     fFreq = float(fSource.fSampleRate) / std::max(1, period);
                 }
             }
-            fT0 = winStart + s;
             fLen = len;
-            // zoom: the louder visible part (scope and history) fills 90% of the lanes, at most x16;
-            // immediate when the signal grows, slow when it decays
-            Geometry g = geometry();
+            // zoom: the louder trace fills 90% of the height, at most x16; immediate when the
+            // signal grows, slow when it decays
             float target = 1.f;
             if (fAutoGain) {
                 float pk = 0.f;
-                int visible = int(g.xa - g.all.left());
-                for (int k = 0; k < 2; k++) {
-                    for (int i = s; i < s + len; i++) pk = std::max(pk, std::fabs(fBuf[k][i]));
-                    const std::deque<Column>& cols = fCols[k];
-                    for (int i = std::max(0, int(cols.size()) - visible); i < int(cols.size()); i++)
-                        pk = std::max(pk, std::max(std::fabs(cols[i].lo), std::fabs(cols[i].hi)));
-                }
+                for (int i = start; i < start + len; i++) pk = std::max(pk, std::max(std::fabs(fBuffer[i]), std::fabs(fBuffer2[i])));
                 target = std::min(16.f, std::max(1.f, 0.9f / std::max(pk, 1e-6f)));
             }
             fGain = (target < fGain) ? target : fGain + (target - fGain) * 0.05f;
-            int pixels = std::max(2, int(g.scopeW));
+            int pixels = std::max(2, width() - 12);
             for (int k = 0; k < 2; k++) {
-                fTraces[k].push_front(trace(k, s, pixels));
+                fTraces[k].push_front(trace(k ? fBuffer2 : fBuffer, start, pixels));
                 while (int(fTraces[k].size()) > fPersistence + 1) fTraces[k].pop_back();
-            }
-
-            // lens: pixel i covers [T0 - S[i+1], T0 - S[i]], the linearly interpolated signal is rasterized.
-            // The history ends at a fixed delay from now (the oldest start of the scope), so it scrolls
-            // steadily while the start of the scope follows the trigger
-            fHistEnd = w - kWindow;
-            std::vector<double> spans = lensSpans(g, double(fT0 - fHistEnd));
-            int lensSamples = int(std::ceil(spans[g.lensW])) + 2;
-            uint64_t lensStart = fT0 - uint64_t(lensSamples);
-            readLanes(lensStart, lensSamples + 2);
-            for (int k = 0; k < 2; k++) {
-                const std::vector<float>& b = fBuf[k];
-                auto at = [&](double t) {
-                    int i = std::max(0, std::min(int(t), lensSamples));
-                    float f = float(t - i);
-                    return b[i] * (1 - f) + b[i + 1] * f;
-                };
-                fLens[k].resize(g.lensW);
-                for (int i = 0; i < g.lensW; i++) {
-                    double t0 = lensSamples - spans[i + 1], t1 = lensSamples - spans[i];
-                    float va = at(t0), vb = at(t1);
-                    float lo = std::min(va, vb), hi = std::max(va, vb);
-                    for (int j = int(t0) + 1; j < t1; j++) { lo = std::min(lo, b[j]); hi = std::max(hi, b[j]); }
-                    fLens[k][i] = { lo, hi };
-                }
             }
             update();
         }
@@ -822,82 +840,37 @@ class WaveScopeModule : public MeterModule
         {
             QPainter p(this);
             paintBackground(p);
-            Geometry g = geometry();
-            float lh = float(g.all.height()) / 2;
-            static const char* names[2][2] = { { "L", "R" }, { "M", "S" } };
-            // divider at the junction, under the traces (mouse over the strip)
-            if (fShowDivider || fDragging) p.fillRect(QRectF(std::floor(g.xj), 0, 1, height()), FQT_BORDER);
-            // newest history column that ends before the lens begins
-            int skip = int(std::max<int64_t>(0, (int64_t(fColEnd) - int64_t(fHistEnd) + fPerColumn - 1) / fPerColumn));
-
-            for (int k = 0; k < 2; k++) {
-                float cy = float(g.all.top()) + lh * (k + 0.5f), amp = lh * 0.45f;
-                auto y = [&](float v) { return cy - std::min(1.f, std::max(-1.f, v * fGain)) * amp; };
-                p.setRenderHint(QPainter::Antialiasing, false);
-                p.fillRect(QRectF(g.all.left(), cy, g.all.width(), 1), FQT_TRACK);
-
-                // history: one vertical line per pixel (on the pixel centers, as the lens: no gap between them)
-                fLines.clear();
-                const std::deque<Column>& cols = fCols[k];
-                int visible = int(g.xa - g.all.left());
-                for (int i = 0; i < visible && skip + i < int(cols.size()); i++) {
-                    const Column& c = cols[cols.size() - 1 - skip - i];
-                    float x = g.xa - 0.5f - i, y0 = y(c.hi), y1 = y(c.lo);
-                    fLines.emplace_back(x, y0, x, std::max(y1, y0 + 1));
-                }
-                p.setPen(QPen(FQT_ACCENT, 1));
-                p.drawLines(fLines.data(), int(fLines.size()));
-
-                // lens: a smooth band from max to min, outlined so that it never gets thinner than the scope line
-                int nl = std::min(int(fLens[k].size()), g.lensW);
-                if (nl > 1) {
-                    QPolygonF band(2 * nl);
-                    for (int i = 0; i < nl; i++) {
-                        const Column& c = fLens[k][i];
-                        float x = g.xj - 0.5f - i;
-                        band[i] = QPointF(x, y(c.hi));
-                        band[2 * nl - 1 - i] = QPointF(x, y(c.lo));
-                    }
-                    p.setRenderHint(QPainter::Antialiasing, true);
-                    p.setPen(fqtLinePen(FQT_ACCENT, 2.0));
-                    p.setBrush(FQT_ACCENT);
-                    p.drawPolygon(band);
-                    p.setBrush(Qt::NoBrush);
-                }
-
-                // scope: older traces fading out, then the newest (with its glow)
-                p.setRenderHint(QPainter::Antialiasing, true);
-                QColor c = FQT_ACCENT;
+            QRectF r = QRectF(rect()).adjusted(6, 8, -6, -8);
+            p.setPen(QPen(FQT_TRACK, 1));
+            p.drawLine(QPointF(r.left(), r.center().y()), QPointF(r.right(), r.center().y()));
+            p.setRenderHint(QPainter::Antialiasing, true);
+            // R first (dimmed), L on top; older traces fading out, newest with its glow
+            for (int k = 1; k >= 0; k--) {
+                QColor color = k ? FQT_TEXT_DIM : FQT_ACCENT, c = color;
                 const std::deque<std::vector<QPointF>>& traces = fTraces[k];
                 for (int i = int(traces.size()) - 1; i >= 1; i--) {
                     float fade = 1.f - float(i) / (fPersistence + 1);
                     c.setAlphaF(0.45f * fade * fade);
                     p.setPen(fqtLinePen(c, 1.5));
-                    paintTrace(p, traces[i], g, cy, amp);
+                    paintTrace(p, traces[i], r);
                 }
-                if (!traces.empty()) {
-                    if (fGlow) {
-                        c.setAlphaF(fqtDark() ? 0.22f : 0.14f);
-                        p.setPen(fqtLinePen(c, 7.0));
-                        paintTrace(p, traces[0], g, cy, amp);
-                    }
-                    p.setPen(fqtLinePen(FQT_ACCENT, 2.0));
-                    paintTrace(p, traces[0], g, cy, amp);
+                if (traces.empty()) continue;
+                if (fGlow) {
+                    c.setAlphaF(fqtDark() ? 0.22f : 0.14f);
+                    p.setPen(fqtLinePen(c, 7.0));
+                    paintTrace(p, traces[0], r);
                 }
-
-                p.setFont(fqtMeterFont(8));
-                p.setPen(FQT_TEXT_DIM);
-                p.drawText(QRectF(g.all.left() + 2, cy - lh / 2, 20, lh), Qt::AlignLeft | Qt::AlignVCenter, names[fMidSide][k]);
+                p.setPen(fqtLinePen(color));
+                paintTrace(p, traces[0], r);
             }
-
-            // period followed by the scope and its zoom
+            // period followed and zoom
             QStringList info;
-            if (fGain > 1.05f) info << QString::fromUtf8("\u00d7%1").arg(fGain, 0, 'f', 1);
+            if (fGain > 1.05f) info << QString::fromUtf8("×%1").arg(fGain, 0, 'f', 1);
             if (fFreq > 0.f) info << QString("%1 Hz").arg(fFreq, 0, 'f', fFreq < 100.f ? 1 : 0);
             if (!info.isEmpty()) {
                 p.setFont(fqtMeterFont(8, false));
                 p.setPen(FQT_TEXT_DIM);
-                p.drawText(QRectF(g.xj, g.all.bottom() - 12, g.scopeW - 2, 12), Qt::AlignRight | Qt::AlignVCenter, info.join("  "));
+                p.drawText(QRectF(0, height() - 16, width() - 6, 12), Qt::AlignRight | Qt::AlignVCenter, info.join("  "));
             }
             paintChips(p);
         }
@@ -1714,6 +1687,7 @@ class FitView : public QGraphicsView
         QGraphicsScene fScene;
         QWidget* fContent;
         QGraphicsProxyWidget* fProxy;
+        int fTop;       // empty band above the controls (title bar buttons)
 
     protected:
 
@@ -1722,9 +1696,11 @@ class FitView : public QGraphicsView
             QGraphicsView::resizeEvent(e);
             QSize natural = fContent->sizeHint().expandedTo(fContent->minimumSizeHint());
             double w = viewport()->width(), h = viewport()->height();
-            double s = std::min(1.0, std::min(w / std::max(1, natural.width()), h / std::max(1, natural.height())));
+            double ch = std::max(1.0, h - fTop);
+            double s = std::min(1.0, std::min(w / std::max(1, natural.width()), ch / std::max(1, natural.height())));
             fProxy->setScale(s);
-            fProxy->resize(w / s, h / s);   // fills the view at any scale
+            fProxy->setPos(0, fTop);
+            fProxy->resize(w / s, ch / s);  // fills the view at any scale
             fScene.setSceneRect(0, 0, w, h);
         }
 
@@ -1733,9 +1709,20 @@ class FitView : public QGraphicsView
             p->fillRect(r, FQT_COLOR(0xf5f5f7, 0x1c1c1e));
         }
 
+        // a press that no control took, in the top band (no title bar): moves the window
+        virtual void mousePressEvent(QMouseEvent* e)
+        {
+            QGraphicsView::mousePressEvent(e);
+            if (!e->isAccepted() && e->button() == Qt::LeftButton
+                && mapTo(window(), e->position().toPoint()).y() < kTitleBand) {
+                e->accept();
+                fqtStartMove(this);
+            }
+        }
+
     public:
 
-        FitView(QWidget* content) : fContent(content)
+        FitView(QWidget* content, int top = 0) : fContent(content), fTop(top)
         {
             setScene(&fScene);
             setFrameShape(QFrame::NoFrame);
@@ -1813,44 +1800,6 @@ class MeterReadout : public QWidget
             p.drawText(text, Qt::AlignCenter, fText);
             if (fHover) p.drawText(QRect(text.right(), 0, 12, height()), Qt::AlignCenter, QString::fromUtf8("\u25B8"));
         }
-};
-
-/**
- * Divider between the strip and the controls: a thin bar of the window color
- * with a small grip in the middle (it must be painted to receive the mouse).
- */
-class MeterSplitterHandle : public QSplitterHandle
-{
-
-    public:
-
-        MeterSplitterHandle(Qt::Orientation o, QSplitter* parent) : QSplitterHandle(o, parent)
-        {
-            setCursor(Qt::SizeVerCursor);
-            setToolTip("Drag to resize the meters, up to close them");
-        }
-
-        virtual void paintEvent(QPaintEvent*)
-        {
-            QPainter p(this);
-            p.fillRect(rect(), FQT_COLOR(0xf5f5f7, 0x1c1c1e));
-            p.setRenderHint(QPainter::Antialiasing, true);
-            p.setPen(Qt::NoPen);
-            p.setBrush(FQT_BORDER);
-            p.drawRoundedRect(QRectF(width() / 2.0 - 18, height() / 2.0 - 1.5, 36, 3), 1.5, 1.5);
-        }
-};
-
-class MeterSplitter : public QSplitter
-{
-
-    protected:
-
-        virtual QSplitterHandle* createHandle() { return new MeterSplitterHandle(orientation(), this); }
-
-    public:
-
-        MeterSplitter() : QSplitter(Qt::Vertical) {}
 };
 
 /**
@@ -1952,7 +1901,8 @@ class MeterRouting : public QWidget
  *   (average and worst block of the period), and the number of "late" blocks,
  *   computed in more time than their duration (likely dropouts);
  * - the block size measured in the audio callback (CoreAudio does not show
- *   it), its duration, the sample rate;
+ *   it), its duration, the sample rate, the inputs and outputs of the DSP
+ *   code;
  * - the default output device and its output latency (buffer + device
  *   latency + safety offset).
  * Cost: a few system calls per update, nothing on the audio thread except
@@ -1965,6 +1915,7 @@ class MeterStatusBar : public QWidget
 
         MeterTiming& fTiming;
         int fSampleRate;
+        int fIns, fOuts;                        // channels of the DSP code
         QTimer fTimer;
         int fUpdates = 0;
 
@@ -2095,6 +2046,7 @@ class MeterStatusBar : public QWidget
                   << QString("dsp %1 (max %2)").arg(pct(fLoad)).arg(pct(fWorstLoad))
                   << QString("block %1 (%2 ms)").arg(block).arg(blockMs, 0, 'f', 1)
                   << QString("%1 kHz").arg(fSampleRate / 1000.0, 0, 'g', 4)
+                  << QString("in %1 \u00b7 out %2").arg(fIns).arg(fOuts)
                   << QString("late %1").arg(fLate);
             QString right = fDevice.isEmpty() ? QString() : QString("%1 \u00b7 out %2 ms").arg(fDevice).arg(fLatencyMs, 0, 'f', 1);
             if (bars != fBars || items != fItems || right != fRight) {
@@ -2111,7 +2063,8 @@ class MeterStatusBar : public QWidget
 
         static const int kHeight = 20;
 
-        MeterStatusBar(MeterTiming& timing, int sample_rate) : fTiming(timing), fSampleRate(sample_rate)
+        MeterStatusBar(MeterTiming& timing, int sample_rate, int ins, int outs)
+            : fTiming(timing), fSampleRate(sample_rate), fIns(ins), fOuts(outs)
         {
             setFixedHeight(kHeight);
             fWall = std::chrono::steady_clock::now();
@@ -2160,10 +2113,10 @@ class MeterStatusBar : public QWidget
 };
 
 /**
- * Columns of the strip: waveform + scope | levels + stereometer | spectrum,
- * in a horizontal splitter. Dragging a border widens the module on its left
- * and narrows the one on its right; a double click on a border restores
- * three equal thirds. The border is a 1 px line, shown only while the mouse
+ * Columns of the strip: waveform | levels + stereometer | oscilloscope |
+ * spectrum, in a horizontal splitter. Dragging a border widens the module on
+ * its left and narrows the one on its right; a double click on a border
+ * restores the default proportions. The border is a 1 px line, shown only while the mouse
  * is over the strip (at rest the strip is one uniform surface), and can be
  * grabbed on 5 px. The proportions are kept when the window is resized and
  * saved per application (MetersPanel).
@@ -2182,7 +2135,7 @@ class MeterColumnHandle : public QSplitterHandle
             : QSplitterHandle(o, parent), fReset(reset), fShow(show)
         {
             setCursor(Qt::SplitHCursor);
-            setToolTip("Drag to resize the modules, double click: equal thirds");
+            setToolTip("Drag to resize the modules, double click: default sizes");
         }
 
         virtual void mouseDoubleClickEvent(QMouseEvent*) { fReset(); }
@@ -2200,7 +2153,7 @@ class MeterColumns : public QSplitter
 
     private:
 
-        std::vector<double> fFractions { 1.0 / 3, 1.0 / 3, 1.0 / 3 };
+        std::vector<double> fDefaults, fFractions;
         std::function<void()> fChanged;
         bool fShowLines = false;
 
@@ -2208,7 +2161,7 @@ class MeterColumns : public QSplitter
 
         virtual QSplitterHandle* createHandle()
         {
-            return new MeterColumnHandle(orientation(), this, [this]() { setFractions({ 1.0 / 3, 1.0 / 3, 1.0 / 3 }); fChanged(); }, &fShowLines);
+            return new MeterColumnHandle(orientation(), this, [this]() { setFractions(fDefaults); fChanged(); }, &fShowLines);
         }
 
         virtual void resizeEvent(QResizeEvent* e)
@@ -2219,7 +2172,8 @@ class MeterColumns : public QSplitter
 
     public:
 
-        MeterColumns(std::function<void()> changed) : QSplitter(Qt::Horizontal), fChanged(changed)
+        MeterColumns(const std::vector<double>& defaults, std::function<void()> changed)
+            : QSplitter(Qt::Horizontal), fDefaults(defaults), fFractions(defaults), fChanged(changed)
         {
             setHandleWidth(5);
             setChildrenCollapsible(false);
@@ -2262,11 +2216,21 @@ class MeterColumns : public QSplitter
 };
 
 /**
- * The strip: the modules side by side (MiniMeters horizontal layout) in
- * three resizable columns (MeterColumns), separated by 1 px lines, with a round button in the top left corner (same
- * style as the window buttons on the right, routing in its tooltip) that
- * opens the routing matrix. It sits in a vertical splitter above the controls: drag the divider
- * to resize it, up to close it, down to reopen it (height saved per application).
+ * The meters: a floating window (MiniMeters style strip) above the window of
+ * the application, shown and hidden by the round button on the left of the
+ * theme button, in the top right corner of the application window. It
+ * stays in front of the other windows (as MiniMeters), can be moved and
+ * resized freely, and remembers its geometry and whether it was open. While it is
+ * hidden nothing is analysed or drawn (the audio thread still copies the
+ * buffers into the rings: a few memory copies per block).
+ *
+ * The modules, side by side in resizable columns (MeterColumns), separated by
+ * 1 px lines shown only while the mouse is over the window: waveform, levels +
+ * stereometer, oscilloscope, spectrum. A round button with a gear in the top
+ * left corner (routing in its tooltip) opens the routing matrix. Frames at
+ * 60 fps from a precise timer.
+ *
+ * The status bar sits at the bottom of the application window, always shown.
  *
  * Usage (see ca-qt-meters.cpp):
  *      MetersPanel* meters = MetersPanel::attach(window, meterDSP, sample_rate);   // before QTGUI::run()
@@ -2279,23 +2243,24 @@ class MetersPanel : public QWidget
     public:
 
         static const int kHeight = 170;     // default height
-        static const int kMinHeight = 80;   // below this, dragging the divider closes the strip
-        static const int kMaxHeight = 600;
+        static const int kMinHeight = 80;
 
     private:
 
         MeterSource fSource;
         std::vector<MeterModule*> fModules;
-        QTimer fTimer;
         QToolButton* fRoutingButton;
         LevelsModule* fLevels = nullptr;
         MeterReadout* fReadout = nullptr;
         QMainWindow* fWindow = nullptr;
-        QSplitter* fSplitter = nullptr;
+        QToolButton* fToggle = nullptr;
         MeterColumns* fColumns = nullptr;
-        WaveScopeModule* fWave = nullptr;
-        bool fStripHover = false;           // mouse over the strip: borders shown
+        bool fStripHover = false;           // mouse over the window: borders shown
         MeterStatusBar* fStatus = nullptr;
+        QTimer fTimer;
+        QTimer fTitlePoll;                  // runs only while the mouse is over one of the windows
+        bool fMainTitle = true;             // title bar buttons shown (the native default)
+        bool fMetersTitle = true;
 
         static QSettings settings() { return QSettings("Faust", QCoreApplication::applicationName()); }
 
@@ -2309,7 +2274,6 @@ class MetersPanel : public QWidget
             return b;
         }
 
-        // routing button text ("O1 | O2") and saved routing
         // routing button: an icon, the routing in its tooltip
         void routingChanged()
         {
@@ -2342,27 +2306,123 @@ class MetersPanel : public QWidget
             fReadout->raise();
         }
 
-        // proportions of the columns, saved as "0.333,0.333,0.333"
+        // proportions of the columns, saved as "0.29,0.30,0.12,0.29"
         void columnsChanged()
         {
             QStringList l;
             for (double v : fColumns->fractions()) l << QString::number(v, 'f', 4);
-            settings().setValue("meters/columns", l.join(","));
+            settings().setValue("meters/columns4", l.join(","));
         }
 
-        bool isOpen() const { return fSplitter && fSplitter->sizes().value(0) > 0; }
-
-        void saveState()
+        // one frame: analysis, readout, borders (only while the window is shown)
+        void frame()
         {
-            int h = fSplitter->sizes().value(0);
-            // closed strip: hide the modules, so that nothing is drawn or composited
-            for (MeterModule* m : fModules) m->setVisible(h > 0);
-            settings().setValue("meters/height", h);
+            if (!isVisible() || isMinimized()) return;
+            for (MeterModule* m : fModules) m->tick();
+            placeReadout();
+            // borders of the modules: shown only while the mouse is over the window
+            bool hover = underMouse();
+            if (hover != fStripHover) {
+                fStripHover = hover;
+                fColumns->setShowLines(hover);
+                fRoutingButton->setVisible(hover || !FQT_TITLE_ON_HOVER);   // with the mode chips
+                update();
+            }
+        }
+
+        // title bar buttons of each window: shown while the mouse is over its top band
+        void titlePoll()
+        {
+            QPoint g = QCursor::pos();
+            bool inside = false;
+            auto check = [&](QWidget* w, bool& shown) {
+                if (!w || !w->isVisible()) return;
+                QPoint l = w->mapFromGlobal(g);
+                bool in = w->rect().contains(l);
+                inside |= in;
+                bool want = in && l.y() < kTitleBand;
+                if (want != shown) {
+                    shown = want;
+                    fqtTitleButtons(w, want);
+                }
+            };
+            check(fWindow, fMainTitle);
+            check(this, fMetersTitle);
+            if (!inside) fTitlePoll.stop();
+        }
+
+        // hide the buttons once the native window exists (and again after any change Qt makes)
+        void hideTitle(QWidget* w, bool& shown)
+        {
+            QTimer::singleShot(0, this, [this, w, &shown]() {
+                shown = false;
+                fqtTitleButtons(w, false);
+                titlePoll();
+            });
+        }
+
+        // position and size; 'open' is saved only when the user shows or hides the window
+        void saveGeometryState(bool open)
+        {
+            settings().setValue("meters/window", saveGeometry());
+            settings().setValue("meters/open", open);
+        }
+
+        // the toggle sits on the left of the theme button of QTUI.h (22 px wide, 6 px from the edge)
+        void placeToggle()
+        {
+            if (fToggle && fWindow) {
+                fToggle->move(fWindow->width() - 22 - 6 - fToggle->width() - 6, 4);
+                fToggle->raise();
+            }
+        }
+
+        void updateToggle()
+        {
+            if (fToggle) fToggle->setToolTip(isVisible() ? "Hide the meters" : "Show the meters");
+        }
+
+    protected:
+
+        virtual void showEvent(QShowEvent* e)
+        {
+            QWidget::showEvent(e);
+            updateToggle();
+            hideTitle(this, fMetersTitle);
+            // repaint at once (no analysis while the window was hidden)
+            for (MeterModule* m : fModules) m->update();
+        }
+
+        virtual void changeEvent(QEvent* e)
+        {
+            QWidget::changeEvent(e);
+            if (e->type() == QEvent::WindowStateChange && isVisible()) hideTitle(this, fMetersTitle);
+        }
+
+        virtual void enterEvent(QEnterEvent* e)
+        {
+            QWidget::enterEvent(e);
+            if (FQT_TITLE_ON_HOVER && !fTitlePoll.isActive()) fTitlePoll.start();
+        }
+
+        virtual void hideEvent(QHideEvent* e)
+        {
+            QWidget::hideEvent(e);
+            updateToggle();
+        }
+
+        virtual void closeEvent(QCloseEvent* e)
+        {
+            // closed (hidden, not deleted): by its close button, or because the application
+            // quits; 'closed' is remembered only in the first case (the application still runs)
+            QWidget::closeEvent(e);
+            QTimer::singleShot(100, this, [this]() { if (fWindow && fWindow->isVisible()) saveGeometryState(false); });
         }
 
     public:
 
-        MetersPanel(MeterDSP* dsp, int sample_rate, QWidget* parent = nullptr) : QWidget(parent)
+        // a normal window (full size title bar buttons), always in front, as MiniMeters
+        MetersPanel(MeterDSP* dsp, int sample_rate, QWidget* parent = nullptr) : QWidget(parent, Qt::Window | Qt::WindowStaysOnTopHint)
         {
             fSource.fDSP = dsp;
             fSource.fSampleRate = sample_rate > 0 ? sample_rate : 48000;
@@ -2372,22 +2432,26 @@ class MetersPanel : public QWidget
                 fSource.load(MeterSource::kLeft, st.value("meters/route_l").toString());
                 fSource.load(MeterSource::kRight, st.value("meters/route_r").toString());
             }
-            setMinimumHeight(kMinHeight);
-            setMaximumHeight(kMaxHeight);
+            setWindowTitle(QCoreApplication::applicationName() + " - meters");
+            setMinimumSize(360, kMinHeight);
+            fqtExpandTitleBar(this);
+            fTitlePoll.setInterval(40);
+            QObject::connect(&fTitlePoll, &QTimer::timeout, [this]() { titlePoll(); });
 
             QHBoxLayout* row = new QHBoxLayout(this);
-            row->setContentsMargins(0, 0, 0, 1);    // bottom line
+            row->setContentsMargins(0, 0, 0, 0);
             row->setSpacing(0);
 
-            // order of the MiniMeters horizontal layout (the oscilloscope continues the waveform, in the
-            // same module), in three resizable columns; the levels keep their width in the middle one
-            fColumns = new MeterColumns([this]() { columnsChanged(); });
+            // order and proportions of the MiniMeters horizontal layout, in resizable columns;
+            // the levels keep their width in the second one
+            fColumns = new MeterColumns({ 0.29, 0.30, 0.12, 0.29 }, [this]() { columnsChanged(); });
             row->addWidget(fColumns);
-            WaveScopeModule* wave = fWave = new WaveScopeModule(fSource);
+            WaveformModule* wave = new WaveformModule(fSource);
             fLevels = new LevelsModule(fSource);
             StereoModule* stereo = new StereoModule(fSource);
+            ScopeModule* scope = new ScopeModule(fSource);
             SpectrumModule* spectrum = new SpectrumModule(fSource);
-            fModules = { wave, fLevels, stereo, spectrum };
+            fModules = { wave, fLevels, stereo, scope, spectrum };
             QWidget* middle = new QWidget();
             QHBoxLayout* pair = new QHBoxLayout(middle);
             pair->setContentsMargins(0, 0, 0, 0);
@@ -2396,96 +2460,110 @@ class MetersPanel : public QWidget
             pair->addWidget(stereo, 1);
             fColumns->addWidget(wave);
             fColumns->addWidget(middle);
+            fColumns->addWidget(scope);
             fColumns->addWidget(spectrum);
-            QStringList saved = settings().value("meters/columns").toString().split(",", Qt::SkipEmptyParts);
-            if (saved.size() == 3) fColumns->setFractions({ saved[0].toDouble(), saved[1].toDouble(), saved[2].toDouble() });
+            QStringList saved = settings().value("meters/columns4").toString().split(",", Qt::SkipEmptyParts);
+            if (saved.size() == 4) fColumns->setFractions({ saved[0].toDouble(), saved[1].toDouble(), saved[2].toDouble(), saved[3].toDouble() });
 
             fReadout = new MeterReadout(this, [this]() { fLevels->nextMode(); });
             fRoutingButton = roundButton(this, 22, QString());
-            fRoutingButton->setText(QString::fromUtf8("\u21C4"));     // arrows: inputs/outputs to L and R
-            fRoutingButton->move(6, 4);
+            fRoutingButton->setText(QString::fromUtf8("\u2699\uFE0E"));     // gear (text style, not emoji)
+            fRoutingButton->move(kGearX, 4);
+            fRoutingButton->setVisible(!FQT_TITLE_ON_HOVER);
             QObject::connect(fRoutingButton, &QToolButton::clicked, [this]() { routingMatrix(); });
             routingChanged();
 
-            QObject::connect(&fTimer, &QTimer::timeout, [this]() {
-                if (!isVisible() || (fSplitter && !isOpen())) return;     // closed strip: no analysis
-                for (MeterModule* m : fModules) m->tick();
-                placeReadout();
-                // borders of the modules: shown only while the mouse is over the strip
-                bool hover = underMouse();
-                if (hover != fStripHover) {
-                    fStripHover = hover;
-                    fColumns->setShowLines(hover);
-                    fWave->setShowDivider(hover);
-                    update();
-                }
-            });
+            // precise timer (60 fps): pacing frames on frameSwapped gave 120 fps (twice the work);
+            // the waveform scrolls with the wall clock, so the motion stays regular
+            fTimer.setTimerType(Qt::PreciseTimer);
+            QObject::connect(&fTimer, &QTimer::timeout, [this]() { frame(); });
             fTimer.start(kMeterFrameMs);
+            setAttribute(Qt::WA_QuitOnClose, false);    // closing the application window quits, as before
+            QObject::connect(qApp, &QCoreApplication::aboutToQuit, [this]() { settings().setValue("meters/window", saveGeometry()); });
         }
 
         /**
-         * Put the strip above the central widget of the QTGUI window and add the toggle button
+         * Make the meters a floating window over the QTGUI window, add the status bar
+         * and the round button that shows and hides the meters
          */
         static MetersPanel* attach(QWidget* window, MeterDSP* dsp, int sample_rate)
         {
-            MetersPanel* panel = new MetersPanel(dsp, sample_rate);
-            panel->fWindow = qobject_cast<QMainWindow*>(window);
-            if (!panel->fWindow) return panel;
+            QMainWindow* main = qobject_cast<QMainWindow*>(window);
+            MetersPanel* panel = new MetersPanel(dsp, sample_rate, window);
+            panel->fWindow = main;
+            if (!main) return panel;
 
             // the controls: QTGUI, taken out of its scroll area and shown in a FitView
-            QWidget* controls = panel->fWindow->takeCentralWidget();
+            QWidget* controls = main->takeCentralWidget();
             QScrollArea* scroll = qobject_cast<QScrollArea*>(controls);
             if (scroll && scroll->widget()) {
                 QWidget* gui = scroll->takeWidget();
                 // extra height goes below the controls instead of stretching their groups
                 if (QBoxLayout* box = qobject_cast<QBoxLayout*>(gui->layout())) box->addStretch(1);
-                controls = new FitView(gui);
+                controls = new FitView(gui, FQT_TITLE_ON_HOVER ? 8 : 0);    // clear of the title bar buttons
                 scroll->deleteLater();
             }
-            panel->fSplitter = new MeterSplitter();
-            panel->fSplitter->setHandleWidth(7);
-            panel->fSplitter->addWidget(panel);
-            panel->fSplitter->addWidget(controls);
-            panel->fSplitter->setCollapsible(0, true);
-            panel->fSplitter->setCollapsible(1, false);
-            // same stretch: when the window is resized, strip and controls keep their proportions
-            // the status bar below everything
+            // controls and status bar
             QWidget* central = new QWidget();
             QVBoxLayout* column = new QVBoxLayout(central);
             column->setContentsMargins(0, 0, 0, 0);
             column->setSpacing(0);
-            column->addWidget(panel->fSplitter, 1);
-            panel->fStatus = new MeterStatusBar(dsp->timing(), panel->fSource.fSampleRate);
+            column->addWidget(controls, 1);
+            panel->fStatus = new MeterStatusBar(dsp->timing(), panel->fSource.fSampleRate,
+                                                dsp->inputs().channels(), dsp->outputs().channels());
             column->addWidget(panel->fStatus);
-            panel->fWindow->setCentralWidget(central);
-            QObject::connect(panel->fSplitter, &QSplitter::splitterMoved, [panel]() { panel->saveState(); });
+            main->setCentralWidget(central);
 
+            fqtExpandTitleBar(main);
+            panel->fToggle = panel->roundButton(main, 22, "Show the meters");
+            panel->fToggle->setText(QString::fromUtf8("\u223F"));     // sine wave
+            main->installEventFilter(panel);    // keeps the button on the left of the theme button
+            QObject::connect(panel->fToggle, &QToolButton::clicked, [panel]() {
+                panel->setVisible(!panel->isVisible());
+                if (panel->isVisible()) panel->raise();
+                panel->saveGeometryState(panel->isVisible());
+            });
             return panel;
         }
 
         /**
-         * QTGUI::run() fits the window to the controls only: make room for the strip
+         * After QTGUI::run(): room for the status bar, then the meters window where it was
+         * (by default right above the application window, as wide)
          */
         void fitWindow()
         {
             if (!fWindow) return;
-            int h = settings().value("meters/height", kHeight).toInt();
-            QScreen* screen = QGuiApplication::primaryScreen();
-            int maxH = screen ? screen->availableGeometry().height() - 40 : 900;
-            int controls = fWindow->height();      // the window was fitted to the controls by QTGUI::run()
-            int status = fStatus ? fStatus->height() : 0;
-            fWindow->resize(std::max(fWindow->width(), 760), std::min(controls + h + fSplitter->handleWidth() + status, maxH));
-            fSplitter->setSizes({ h, controls });   // rescaled by the splitter if the screen is too small
-            saveState();
+            fWindow->resize(std::max(fWindow->width(), 520), fWindow->height() + (fStatus ? fStatus->height() : 0));
+            placeToggle();
+            if (!restoreGeometry(settings().value("meters/window").toByteArray())) {
+                QRect f = fWindow->frameGeometry();
+                QScreen* screen = fWindow->screen();
+                int top = screen ? screen->availableGeometry().top() : 0;
+                int title = f.height() - fWindow->height();     // height of a title bar (0 without one)
+                if (title < 20 && !FQT_TITLE_ON_HOVER) title = 32;
+                int y = std::max(top + title, f.top() - kHeight);     // contents, title bar above them
+                setGeometry(f.left(), y, std::max(fWindow->width(), 760), kHeight);
+            }
+            setVisible(settings().value("meters/open", true).toBool());
+            updateToggle();
+        }
+
+        bool eventFilter(QObject* obj, QEvent* event) override
+        {
+            if (obj == fWindow) {
+                if (event->type() == QEvent::Resize) placeToggle();
+                if (event->type() == QEvent::Show || event->type() == QEvent::WindowStateChange) hideTitle(fWindow, fMainTitle);
+                if (event->type() == QEvent::Enter && FQT_TITLE_ON_HOVER && !fTitlePoll.isActive()) fTitlePoll.start();
+            }
+            return QWidget::eventFilter(obj, event);
         }
 
         virtual void paintEvent(QPaintEvent*)
         {
-            // separator between the levels and the stereometer (shown with the borders of the
-            // columns, otherwise the background of the modules) and bottom line
+            // separator between the levels and the stereometer: shown with the borders of the
+            // columns, otherwise the background of the modules
             QPainter p(this);
             p.fillRect(rect(), fStripHover ? FQT_BORDER : FQT_METER_BG);
-            p.fillRect(QRectF(0, height() - 1, width(), 1), FQT_BORDER);
         }
 };
 

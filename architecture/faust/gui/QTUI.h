@@ -141,6 +141,7 @@ static inline bool fqtDark()
 #define FQT_KNOB_BOTTOM FQT_COLOR(0xececf0, 0x323236)   // knob face, bottom of the gradient
 #define FQT_TEXT        FQT_COLOR(0x1d1d1f, 0xf2f2f4)   // pointer, scale text
 #define FQT_TEXT_DIM    FQT_COLOR(0x86868b, 0x8e8e93)   // dB scale marks
+#define FQT_OVER        QColor(0xe0, 0x30, 0x20)        // dB bargraphs over 0 dB (as the clip of the meters)
 
 // Compact sizes, so that more controls fit in a window without scrolling
 #define FQT_SLIDER_LENGTH   120     // was 160
@@ -426,7 +427,9 @@ public:
 };
 
 /**
- * Displays dB values using a scale of colors
+ * Base of the dB displays, in the colors of the theme (Luca Spanedda): the level
+ * in FQT_SIGNAL, the part over 0 dB in FQT_OVER, on the FQT_TRACK background
+ * (the green / yellow / orange / red steps of the original are gone)
  */
 class dbAbstractDisplay : public AbstractDisplay
 {
@@ -435,81 +438,13 @@ protected:
     
     FAUSTFLOAT fScaleMin;
     FAUSTFLOAT fScaleMax;
-    std::vector<int>     fLevel;
-    std::vector<QBrush>  fBrush;
     
-    /**
-     * Create the scale of colors used to paint the bargraph in relation to the levels
-     * The parameter x indicates the direction of the gradient. x=1 means an horizontal
-     * gradient typically used by a vertical bargraph, and x=0 a vertical gradient.
-     */
-    void initLevelsColors(int x)
+    // position of a dB value between the bottom (0) and the top (1) of the range
+    double dB2Unit(FAUSTFLOAT dB) const
     {
-        int alpha = 200;
-        { // level until -10 dB
-            QColor c(40, 160, 40, alpha);
-            QLinearGradient g(0,0,x,1-x);
-            g.setCoordinateMode(QGradient::ObjectBoundingMode);
-            g.setColorAt(0.0, c.lighter());
-            g.setColorAt(0.2, c);
-            g.setColorAt(0.8, c);
-            g.setColorAt(0.9, c.darker(120));
-            
-            fLevel.push_back(-10);
-            fBrush.push_back(QBrush(g));
-        }
-        
-        { // level until -6 dB
-            QColor c(160, 220, 20, alpha);
-            QLinearGradient g(0,0,x,1-x);
-            g.setCoordinateMode(QGradient::ObjectBoundingMode);
-            g.setColorAt(0.0, c.lighter());
-            g.setColorAt(0.2, c);
-            g.setColorAt(0.8, c);
-            g.setColorAt(0.9, c.darker(120));
-            
-            fLevel.push_back(-6);
-            fBrush.push_back(QBrush(g));
-        }
-        
-        { // level until -3 dB
-            QColor c(220, 220, 20, alpha);
-            QLinearGradient g(0,0,x,1-x);
-            g.setCoordinateMode(QGradient::ObjectBoundingMode);
-            g.setColorAt(0.0, c.lighter());
-            g.setColorAt(0.2, c);
-            g.setColorAt(0.8, c);
-            g.setColorAt(0.9, c.darker(120));
-            
-            fLevel.push_back(-3);
-            fBrush.push_back(QBrush(g));
-        }
-        
-        { // level until -0 dB
-            QColor c(240, 160, 20, alpha);
-            QLinearGradient g(0,0,x,1-x);
-            g.setCoordinateMode(QGradient::ObjectBoundingMode);
-            g.setColorAt(0.0, c.lighter());
-            g.setColorAt(0.2, c);
-            g.setColorAt(0.8, c);
-            g.setColorAt(0.9, c.darker(120));
-            
-            fLevel.push_back(0);
-            fBrush.push_back(QBrush(g));
-        }
-        
-        { // until 10 dB (and over because last one)
-            QColor c(240,  0, 20, alpha);   // ColorOver
-            QLinearGradient g(0,0,x,1-x);
-            g.setCoordinateMode(QGradient::ObjectBoundingMode);
-            g.setColorAt(0.0, c.lighter());
-            g.setColorAt(0.2, c);
-            g.setColorAt(0.8, c);
-            g.setColorAt(0.9, c.darker(120));
-            
-            fLevel.push_back(+10);
-            fBrush.push_back(QBrush(g));
-        }
+        if (fScaleMax == fScaleMin) return 0;
+        double u = (dB2Scale(dB) - fScaleMin) / (fScaleMax - fScaleMin);
+        return u < 0 ? 0 : (u > 1 ? 1 : u);
     }
     
 public:
@@ -529,32 +464,24 @@ public:
 };
 
 /**
- * Small rectangular LED display which color changes with the level in dB
+ * Small rectangular LED display: the theme signal color, more opaque as the
+ * level grows, FQT_OVER over 0 dB
  */
 class dbLED : public dbAbstractDisplay
 {
     
 protected:
     
-    /**
-     * Draw the LED using a color depending of its value in dB
-     */
     virtual void paintEvent(QPaintEvent*)
     {
         QPainter painter(this);
         painter.fillRect(rect(), FQT_TRACK);
-        
-        if (fValue <= fLevel[0]) {
-            // interpolate the first color on the alpha channel
-            QColor c(40, 160, 40) ;
-            FAUSTFLOAT a = (fValue-fMin)/(fLevel[0]-fMin);
-            c.setAlphaF(a);
-            painter.fillRect(rect(), c);
-            
+        if (fValue > 0) {
+            painter.fillRect(rect(), FQT_OVER);
         } else {
-            // find the minimal level > value
-            size_t l = fLevel.size()-1; while (fValue < fLevel[l] && l > 0) l--;
-            painter.fillRect(rect(), fBrush[l]);
+            QColor c = FQT_SIGNAL;
+            c.setAlphaF(dB2Unit(fValue) / std::max(1e-6, dB2Unit(0)));
+            painter.fillRect(rect(), c);
         }
         painter.setPen(FQT_BORDER);
         painter.drawRect(rect().adjusted(0, 0, -1, -1));
@@ -565,7 +492,6 @@ public:
     dbLED(FAUSTFLOAT lo, FAUSTFLOAT hi) : dbAbstractDisplay(lo,hi)
     {
         setSizePolicy(QSizePolicy::Fixed, QSizePolicy::Fixed);
-        initLevelsColors(1);
     }
     
     virtual QSize sizeHint() const
@@ -705,70 +631,95 @@ public:
 };
 
 /**
- * A dB Bargraph with a scale of colors
+ * A dB bargraph in the style of the theme: a thin bar (FQT_SIGNAL, FQT_OVER over
+ * 0 dB, a faint line at 0 dB) and its scale beside it, outside the bar. Marks are
+ * chosen by importance (0, -20, -40, ...) and drawn only where they do not overlap,
+ * so a wide range (-120..+20) stays readable.
  */
 class dbBargraph : public dbAbstractDisplay
 {
     
 protected:
     
-    QBrush fBackColor;
+    static const int kBar = FQT_METER_THICK;    // thickness of the bar
     
-    // These two abstract methods are implemented
-    // according to the vertical or horizontal direction
-    // in dbVerticalBargraph and dbHorizontalBargraph
-    virtual void paintMark(QPainter* painter, FAUSTFLOAT v) const = 0;
-    virtual int paintSegment(QPainter* painter, int pos, FAUSTFLOAT v, const QBrush& b) const = 0;
+    bool fVertical;
     
-    /**
-     * Draw the logarithmic scale
-     */
-    void paintScale(QPainter* painter) const
+    // the bar and the band of the scale
+    QRect barRect() const
     {
-        painter->fillRect(0,0,width(),height(), FQT_TRACK);
-        painter->save();
-        painter->setPen(FQT_TEXT_DIM);
-        for (FAUSTFLOAT v = -10; v > fMin; v -= 10) paintMark(painter, v);
-        for (FAUSTFLOAT v = -6; v < fMax; v += 3) paintMark(painter, v);
-        painter->restore();
+        return fVertical ? QRect(width() - kBar, 0, kBar, height()) : QRect(0, 0, width(), kBar);
     }
     
-    /**
-     * Draw the content using colored segments
-     */
-    void paintContent(QPainter* painter) const
+    // position along the bar, in pixels from its start (bottom or left)
+    double pos(FAUSTFLOAT dB) const
     {
-        size_t l = fLevel.size();
-        
-        FAUSTFLOAT p = -1;   // fake value indicates to start from border
-        size_t n = 0;
-        // paint all the full segments < fValue
-        for (n = 0; (n < l) && (fValue > fLevel[n]); n++) {
-            p = paintSegment(painter, p, fLevel[n], fBrush[n]);
+        QRect b = barRect();
+        return dB2Unit(dB) * (fVertical ? b.height() : b.width());
+    }
+    
+    QRectF segment(double p0, double p1) const
+    {
+        QRect b = barRect();
+        return fVertical ? QRectF(b.left(), b.bottom() + 1 - p1, b.width(), p1 - p0)
+                         : QRectF(b.left() + p0, b.top(), p1 - p0, b.height());
+    }
+    
+    void paintScale(QPainter& p) const
+    {
+        static const int marks[] = { 0, -20, -40, -60, -10, -30, -50, -6, -12, -3, 6, 12, -80, -100, -120, 3, 18, 20 };
+        QFontMetrics fm(font());
+        QRect b = barRect();
+        std::vector<QRect> kept;
+        p.setPen(FQT_TEXT_DIM);
+        for (int v : marks) {
+            if (v < fMin || v > fMax) continue;
+            QString t = (v > 0) ? QString("+%1").arg(v) : QString::number(v);
+            double x = pos(v);
+            QRect r;
+            if (fVertical) {
+                r = QRect(0, int(b.bottom() + 1 - x) - fm.height() / 2, b.left() - 3, fm.height());
+                r.moveTop(std::max(0, std::min(r.top(), height() - fm.height())));
+            } else {
+                int w = fm.horizontalAdvance(t);
+                r = QRect(int(x) - w / 2, b.bottom() + 2, w, fm.height());
+                r.moveLeft(std::max(0, std::min(r.left(), width() - w)));
+            }
+            // only where it does not touch a more important mark (at its final place)
+            QRect room = fVertical ? r.adjusted(0, -1, 0, 1) : r.adjusted(-4, 0, 4, 0);
+            bool free = true;
+            for (const QRect& k : kept) if (room.intersects(k)) free = false;
+            if (!free) continue;
+            kept.push_back(r);
+            p.drawText(r, fVertical ? (Qt::AlignRight | Qt::AlignVCenter) : Qt::AlignCenter, t);
         }
-        // paint the last segment
-        if (n == l) n = n-1;
-        p=paintSegment(painter, p, fValue, fBrush[n]);
-        
-        painter->setPen(FQT_BORDER);
-        painter->drawRect(0,0,width()-1,height()-1);
     }
     
     virtual void paintEvent(QPaintEvent*)
     {
-        QPainter painter(this);
-        paintScale(&painter);
-        paintContent(&painter);
+        QPainter p(this);
+        QRect b = barRect();
+        p.fillRect(b, FQT_TRACK);
+        double v = pos(fValue), z = pos(0);
+        if (fValue > fMin) p.fillRect(segment(0, std::min(v, z)), FQT_SIGNAL);
+        if (fValue > 0) p.fillRect(segment(z, v), FQT_OVER);
+        if (fMin < 0 && fMax > 0) {
+            QColor c = FQT_TEXT_DIM;
+            c.setAlpha(110);
+            p.fillRect(segment(z - 0.5, z + 0.5), c);   // 0 dB
+        }
+        p.setPen(FQT_BORDER);
+        p.drawRect(b.adjusted(0, 0, -1, -1));
+        paintScale(p);
     }
     
 public:
     
-    dbBargraph(FAUSTFLOAT lo, FAUSTFLOAT hi) : dbAbstractDisplay(lo,hi)
+    dbBargraph(FAUSTFLOAT lo, FAUSTFLOAT hi, bool vertical) : dbAbstractDisplay(lo,hi), fVertical(vertical)
     {
         QFont f = this->font();
         f.setPointSize(8);
         this->setFont(f);
-        fBackColor = QBrush(FQT_TRACK);
     }
 };
 
@@ -778,56 +729,16 @@ public:
 class dbVerticalBargraph : public dbBargraph
 {
     
-protected:
-    /**
-     * Convert a dB value into a vertical position
-     */
-    FAUSTFLOAT dB2y(FAUSTFLOAT dB) const
-    {
-        FAUSTFLOAT s0 = fScaleMin;
-        FAUSTFLOAT s1 = fScaleMax;
-        FAUSTFLOAT sx = dB2Scale(dB);
-        int h = height();
-        return h - h*(s0-sx)/(s0-s1);
-    }
-    
-    /**
-     * Paint a vertical graduation mark
-     */
-    virtual void paintMark(QPainter* painter, FAUSTFLOAT v) const
-    {
-        int n = 10;
-        int y = dB2y(v);
-        QRect r(0,y-n,width()-1,2*n);
-        if (v > 0.0) {
-            painter->drawText(r, Qt::AlignRight|Qt::AlignVCenter, QString::number(v).prepend('+'));
-        } else {
-            painter->drawText(r, Qt::AlignRight|Qt::AlignVCenter, QString::number(v));
-        }
-    }
-    
-    /**
-     * Paint a color segment
-     */
-    virtual int paintSegment(QPainter* painter, int pos, FAUSTFLOAT v, const QBrush& b) const
-    {
-        if (pos == -1) pos = height();
-        FAUSTFLOAT y = dB2y(v);
-        painter->fillRect(0, y, width(), pos-y+1, b);
-        return y;
-    }
-    
 public:
     
-    dbVerticalBargraph(FAUSTFLOAT lo, FAUSTFLOAT hi) : dbBargraph(lo,hi)
+    dbVerticalBargraph(FAUSTFLOAT lo, FAUSTFLOAT hi) : dbBargraph(lo, hi, true)
     {
         setSizePolicy(QSizePolicy::Fixed, QSizePolicy::Preferred);
-        initLevelsColors(1);
     }
     
     virtual QSize sizeHint() const
     {
-        return QSize(FQT_METER_THICK + 14, FQT_METER_LENGTH + 40);
+        return QSize(kBar + 3 + QFontMetrics(font()).horizontalAdvance("-100"), FQT_METER_LENGTH + 40);
     }
 };
 
@@ -837,53 +748,16 @@ public:
 class dbHorizontalBargraph : public dbBargraph
 {
     
-protected:
-    
-    /**
-     * Convert a dB value into an horizontal position
-     */
-    FAUSTFLOAT dB2x(FAUSTFLOAT dB) const
-    {
-        FAUSTFLOAT s0 = fScaleMin;
-        FAUSTFLOAT s1 = fScaleMax;
-        FAUSTFLOAT sx = dB2Scale(dB);
-        int    w = width();
-        return w - w*(s1-sx)/(s1-s0);
-    }
-    
-    /**
-     * Paint an horizontal graduation mark
-     */
-    void paintMark(QPainter* painter, FAUSTFLOAT v) const
-    {
-        int n = 10;
-        int x = dB2x(v);
-        QRect r(x-n, 0, 2*n, height());
-        painter->drawText(r, Qt::AlignHCenter|Qt::AlignVCenter, QString::number(v));
-    }
-    
-    /**
-     * Paint a horizontal color segment
-     */
-    int paintSegment(QPainter* painter, int pos, FAUSTFLOAT v, const QBrush& b) const
-    {
-        if (pos == -1) pos = 0;
-        FAUSTFLOAT x = dB2x(v);
-        painter->fillRect(pos, 0, x-pos, height(), b);
-        return x;
-    }
-    
 public:
     
-    dbHorizontalBargraph(FAUSTFLOAT lo, FAUSTFLOAT hi) : dbBargraph(lo, hi)
+    dbHorizontalBargraph(FAUSTFLOAT lo, FAUSTFLOAT hi) : dbBargraph(lo, hi, false)
     {
         setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Fixed);
-        initLevelsColors(0);
     }
     
     virtual QSize sizeHint() const
     {
-        return QSize(FQT_METER_LENGTH + 40, FQT_METER_THICK + 6);
+        return QSize(FQT_METER_LENGTH + 40, kBar + 2 + QFontMetrics(font()).height());
     }
     
 };
