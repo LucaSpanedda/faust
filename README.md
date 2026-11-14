@@ -32,30 +32,29 @@ The original README is in the upstream repository.
 Usual build: `faust2caqt -double -midi -resample -preset auto file.dsp`
 
 - **`faust2caqt-meters`** (`tools/faust2appls/faust2caqt-meters`, `architecture/ca-qt-meters.cpp`,
-  `architecture/faust/gui/QTMeters.h`): same as `faust2caqt` (same options), plus a floating
-  meters window modelled on MiniMeters, drawn by the GPU at 60 fps with the colors of the
-  light/dark theme:
-  - the round button `∿` (left of the theme button) shows and hides the meters window; it stays
-    in front of the other windows, is resizable, and remembers position, size and open/closed
-    state per application; when hidden the analysis stops and it costs about nothing;
-  - title bar on demand (macOS, Qt >= 6.9), in both windows: the contents extend under the
-    title bar and the close / minimize / zoom buttons appear only while the mouse is over the
-    top band; drag an empty part of that band to move the application window, any part of a
-    module that is not a control to move the meters;
+  `architecture/faust/gui/QTMeters.h`): same as `faust2caqt` (same options), plus an analysis strip
+  above the controls, in the same window, modelled on MiniMeters, drawn by the GPU at 60 fps with
+  the colors of the light/dark theme:
+  - the divider below the strip resizes it, closes it (drag up) and reopens it (drag down); when
+    closed the analysis stops and the application costs as much as `faust2caqt`;
   - four resizable columns: waveform | levels + stereometer | oscilloscope | spectrum; drag a
     border to resize (double click: default proportions); the borders are shown only while the
-    mouse is over the window;
+    mouse is over the strip;
   - waveform: L and R (or Mid and Side) in two lanes, min/max envelope scrolling smoothly with
     the wall clock (fractional pixel steps), speed slow/normal/fast;
   - oscilloscope: full height, L and R overlaid, Follow Pitch, 1 or 4 cycles, 1:1 or Zoom on quiet
     signals, optional persistence and glow;
   - levels (peak, RMS Fast/Slow, LUFS Momentary/Short-Term/Integrated with BS.1770 gating,
     maximum peak in the tooltip);
-  - stereometer with L/R/mono axes, phosphor fading and correlation;
+  - stereometer with L/R/mono axes, phosphor fading and correlation, or phase view (chip
+    Stereo | Phase): Takens delay embedding of one signal (L, R or Mid), x(t) against
+    x(t + tau), so a periodic signal draws a closed curve and a chaotic one its attractor; tau
+    automatic (first zero of the autocorrelation, or where it falls below 1/e; smoothed) or
+    fixed (0.1-10 ms); same cost as the stereometer;
   - spectrum (two curves, dotted peak hold, readout of the loudest frequency with note and cents;
     FFT size follows the sample rate) or spectrogram;
-  - everything shows two signals, L and R: a routing matrix (gear button, top left, shown with
-    the mouse over the window; the routing is in its tooltip) sends any input or output of the
+  - everything shows two signals, L and R: a routing matrix (gear button, top left; the routing
+    is in its tooltip) sends any input or output of the
     DSP to L and/or R; several channels on a side are averaged;
   - mode chips: moving the mouse over a module shows its main modes as small buttons; a click on
     the level bars (or their readout) selects the next level mode; right click: all the options;

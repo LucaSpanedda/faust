@@ -1,11 +1,9 @@
 /************************** BEGIN QTMeters.h **************************
- Meters for the Faust QT applications (Luca Spanedda), modelled on MiniMeters:
- waveform, levels/loudness, stereometer, oscilloscope and spectrum (or
- spectrogram) in a floating window shown by a round button of the QTGUI
- window, and a status bar below the controls (CPU per core, DSP load, block
- size, channels). On macOS both windows have a title bar on demand: contents
- under it, close / minimize / zoom buttons only while the mouse is over the
- top band.
+ Analysis strip for the Faust QT applications (Luca Spanedda), modelled on
+ MiniMeters: waveform, levels/loudness, stereometer (or phase view: Takens
+ delay embedding), oscilloscope and spectrum (or spectrogram), above the
+ controls of the QTGUI window (drag the divider to resize or close it), and a
+ status bar below them (CPU per core, DSP load, block size, channels).
 
  Everything shows two signals, L and R. A routing matrix (gear button in the
  top left corner of the meters) decides which inputs and outputs of the DSP
@@ -59,8 +57,6 @@
 #include <QTimer>
 #include <QToolButton>
 #include <QVBoxLayout>
-#include <QWindow>
-#include <QCursor>
 
 #include "faust/dsp/dsp.h"
 
@@ -322,86 +318,6 @@ static inline QPen fqtLinePen(const QColor& color, double width = 2.0)
 }
 #define FQT_CLIP        QColor(0xe0, 0x30, 0x20)        // peak hold at 0 dBFS
 
-//==============================TITLE BAR=====================================
-
-/**
- * Title bar on demand (macOS, Qt >= 6.9): the contents of both windows extend
- * under the title bar, the title is hidden and the close / minimize / zoom
- * buttons appear only while the mouse is over the top band of the window.
- * The windows are moved by dragging an empty part of that band (the meters:
- * any part of a module that is not a control).
- */
-#if defined(__APPLE__) && QT_VERSION >= QT_VERSION_CHECK(6, 9, 0)
-#define FQT_TITLE_ON_HOVER 1
-#else
-#define FQT_TITLE_ON_HOVER 0
-#endif
-
-static const int kTitleBand = 28;   // height of the macOS title bar, where its buttons sit
-static const int kGearX = FQT_TITLE_ON_HOVER ? 74 : 6;     // routing button, right of the title bar buttons
-
-// before the window is shown: contents under a transparent title bar
-static inline void fqtExpandTitleBar(QWidget* w)
-{
-#if FQT_TITLE_ON_HOVER
-    w->setWindowFlag(Qt::ExpandedClientAreaHint, true);
-    w->setWindowFlag(Qt::NoTitleBarBackgroundHint, true);
-    w->setAttribute(Qt::WA_ContentsMarginsRespectsSafeArea, false);
-#else
-    (void)w;
-#endif
-}
-
-// the Objective-C runtime, declared here: its headers clash with others in the application
-#if FQT_TITLE_ON_HOVER
-extern "C" void* sel_registerName(const char* name);
-extern "C" void objc_msgSend(void);
-
-static inline void* fqtSend(void* obj, const char* sel)
-{
-    return ((void* (*)(void*, void*))objc_msgSend)(obj, sel_registerName(sel));
-}
-
-static inline void* fqtSend(void* obj, const char* sel, long arg)
-{
-    return ((void* (*)(void*, void*, long))objc_msgSend)(obj, sel_registerName(sel), arg);
-}
-
-// the NSWindow of a shown top level widget (null before it is shown)
-static inline void* fqtNSWindow(QWidget* w)
-{
-    if (!w->windowHandle()) return nullptr;
-    void* view = (void*)w->winId();
-    return view ? fqtSend(view, "window") : nullptr;
-}
-#endif
-
-// show or hide the close / minimize / zoom buttons (the title text stays hidden)
-static inline void fqtTitleButtons(QWidget* w, bool show)
-{
-#if FQT_TITLE_ON_HOVER
-    void* win = fqtNSWindow(w);
-    if (!win) return;
-    fqtSend(win, "setTitleVisibility:", 1);     // NSWindowTitleHidden
-    for (long i = 0; i < 3; i++) {              // NSWindowCloseButton, NSWindowMiniaturizeButton, NSWindowZoomButton
-        void* b = fqtSend(win, "standardWindowButton:", i);
-        if (b) ((void (*)(void*, void*, bool))objc_msgSend)(b, sel_registerName("setHidden:"), !show);
-    }
-#else
-    (void)w; (void)show;
-#endif
-}
-
-// drag the window from a press that no control took
-static inline void fqtStartMove(QWidget* w)
-{
-#if FQT_TITLE_ON_HOVER
-    if (QWindow* h = w->window()->windowHandle()) h->startSystemMove();
-#else
-    (void)w;
-#endif
-}
-
 #ifdef FQT_METERS_NO_GL
 typedef QWidget MeterSurface;
 static const int kMeterFrameMs = 40;    // 25 fps
@@ -484,6 +400,10 @@ class MeterModule : public MeterSurface
             for (const ChipGroup& g : chipGroups()) {
                 float w = 2.f;
                 for (const QString& l : g.labels) w += float(fm.horizontalAdvance(l)) + 2 * pad;
+                if (x > float(o.x()) && x + w > float(width()) - 4.f) {     // no room: next row
+                    x = float(o.x());
+                    o.setY(o.y() + h + 4.f);
+                }
                 QRectF box(x, o.y(), w, h);
                 p.setPen(QPen(FQT_BORDER, 1));
                 p.setBrush(FQT_METER_BG);
@@ -537,7 +457,6 @@ class MeterModule : public MeterSurface
                     return;
                 }
             }
-            fqtStartMove(this);     // not on a chip: move the window
         }
 
         virtual void tick() = 0;    // read the ring and analyse (GUI thread, once per frame)
@@ -598,7 +517,7 @@ class WaveformModule : public MeterModule
             return { { "midside", &fMidSide, { "L/R", "M/S" }, { 0, 1 } } };
         }
 
-        virtual QPointF chipOrigin() const { return QPointF(kGearX + 28, 8); }     // right of the routing button
+        virtual QPointF chipOrigin() const { return QPointF(34, 8); }     // right of the routing button
 
         virtual void optionsChanged() { fVersion = -1; }   // restart the history
 
@@ -1188,6 +1107,16 @@ class LevelsModule : public MeterModule
  * quiet signals stay visible) and Linear (1:1); both rotated by 45 degrees:
  * mid up, side horizontal, with faint L, R and mono axes. Phosphor: the
  * samples fade with their age (the last 2048, in four bands).
+ *
+ * Phase view (Takens delay embedding): one signal (L by default, or R, or
+ * Mid) against itself delayed, x(t) horizontal and x(t + tau) vertical: a
+ * sine draws a closed loop, a periodic signal a closed curve, a chaotic one
+ * its attractor. Auto delay: the first zero of the autocorrelation (through
+ * an FFT, as the spectrum), or where it falls below 1/e if it never reaches
+ * zero (fast decorrelating chaotic signals); estimated 15 times per second
+ * and smoothed, so the figure does not jump. Fixed delays in the menu.
+ * Scaled: the figure fills the square (peak normalised, immediate when the
+ * signal grows, slow when it decays); Linear: 1:1.
  */
 class StereoModule : public MeterModule
 {
@@ -1195,6 +1124,7 @@ class StereoModule : public MeterModule
     private:
 
         enum { kScaled, kLinear };
+        enum { kStereo, kPhase };
         static const int kPoints = 2048;
         static const int kBands = 4;            // age bands of the phosphor
         std::vector<float> fL, fR;
@@ -1202,12 +1132,29 @@ class StereoModule : public MeterModule
         float fCorr = 0.f;
         int fMode = kScaled;
         int fPhosphor = 1;
+        int fView = kStereo;
+
+        // phase view
+        int fSignal = 0;                        // 0 = L, 1 = R, 2 = Mid
+        int fDelayUs = 0;                       // 0 = auto, otherwise fixed delay in microseconds
+        float fTau = 0.f;                       // delay in samples (smoothed)
+        float fPhaseGain = 1.f;
+        int fEstimate = 0;                      // frame counter of the delay estimate
+        std::vector<float> fX;
+        std::vector<std::complex<float>> fAC;
 
         virtual void fillMenu(QMenu* menu)
         {
+            addChoice(menu, "View", "view", fView, { "Stereo (L / R)", "Phase (signal / delayed signal)" }, { kStereo, kPhase });
             addChoice(menu, "Display", "mode", fMode, { "Scaled", "Linear" }, { kScaled, kLinear });
             addChoice(menu, "Phosphor", "phosphor", fPhosphor, { "On", "Off" }, { 1, 0 });
+            addChoice(menu, "Phase: signal", "signal", fSignal, { "L", "R", "Mid" }, { 0, 1, 2 });
+            addChoice(menu, "Phase: delay", "delay", fDelayUs,
+                      { "Auto (first zero of the autocorrelation)", "0.1 ms", "0.25 ms", "0.5 ms", "1 ms", "2 ms", "5 ms", "10 ms" },
+                      { 0, 100, 250, 500, 1000, 2000, 5000, 10000 });
         }
+
+        virtual void optionsChanged() { fEstimate = 0; }
 
         // map a pair of samples to the unit square, center = silence
         QPointF map(float l, float r) const
@@ -1223,6 +1170,137 @@ class StereoModule : public MeterModule
             return QPointF(x, y);
         }
 
+        // analysis window of the phase view: about 85 ms at any sample rate
+        int phaseWindow() const
+        {
+            int n = 4096;
+            while (n < 16384 && n * 48000 < 4096 * fSource.fSampleRate) n *= 2;
+            return n;
+        }
+
+        // in-place iterative radix-2 FFT (inverse: conjugated twiddles, not scaled)
+        static void fft(std::vector<std::complex<float>>& a, bool inverse)
+        {
+            int n = int(a.size());
+            for (int i = 1, j = 0; i < n; i++) {
+                int bit = n >> 1;
+                for (; j & bit; bit >>= 1) j ^= bit;
+                j ^= bit;
+                if (i < j) std::swap(a[i], a[j]);
+            }
+            for (int len = 2; len <= n; len <<= 1) {
+                double ang = 2 * M_PI / len * (inverse ? 1 : -1);
+                std::complex<float> wl(float(std::cos(ang)), float(std::sin(ang)));
+                for (int i = 0; i < n; i += len) {
+                    std::complex<float> w(1.f, 0.f);
+                    for (int j = 0; j < len / 2; j++) {
+                        std::complex<float> u = a[i + j], v = a[i + j + len / 2] * w;
+                        a[i + j] = u + v;
+                        a[i + j + len / 2] = u - v;
+                        w *= wl;
+                    }
+                }
+            }
+        }
+
+        // delay in samples: first zero of the autocorrelation of the window, or where it
+        // falls below 1/e; -1 on silence
+        float autoDelay(const std::vector<float>& x)
+        {
+            int n = int(x.size());
+            double mean = 0;
+            for (float v : x) mean += v;
+            mean /= n;
+            std::vector<std::complex<float>>& ac = fAC;
+            ac.assign(2 * n, std::complex<float>(0.f, 0.f));     // zero padded: linear, not circular
+            for (int i = 0; i < n; i++) ac[i] = std::complex<float>(float(x[i] - mean), 0.f);
+            fft(ac, false);
+            for (auto& c : ac) c = std::complex<float>(std::norm(c), 0.f);
+            fft(ac, true);
+            float r0 = ac[0].real();
+            if (r0 < 1e-12f * n) return -1.f;
+            int maxLag = n / 4;
+            int below = -1;
+            for (int k = 2; k < maxLag; k++) {
+                // unbiased: each lag has n - k products
+                float r = ac[k].real() / r0 * float(n) / float(n - k);
+                if (r <= 0.f) return float(k);
+                if (below < 0 && r < 0.3679f) below = k;
+            }
+            return float(below > 0 ? below : maxLag);
+        }
+
+        void tickPhase()
+        {
+            int n = phaseWindow();
+            fL.resize(n); fR.resize(n); fX.resize(n);
+            fSource.readPair(fL.data(), fR.data(), n);
+            for (int i = 0; i < n; i++) fX[i] = fSignal == 0 ? fL[i] : (fSignal == 1 ? fR[i] : 0.5f * (fL[i] + fR[i]));
+            if (fDelayUs > 0) {
+                fTau = float(fDelayUs) * 1e-6f * float(fSource.fSampleRate);
+            } else if (fEstimate++ % 4 == 0) {     // 15 times per second
+                float t = autoDelay(fX);
+                if (t > 0.f) fTau = (fTau <= 0.f) ? t : std::exp(std::log(fTau) * 0.7f + std::log(t) * 0.3f);
+            }
+            int tau = std::max(1, std::min(int(std::lround(fTau)), n - kPoints));
+            // Scaled: the figure fills 90% of the square
+            float target = 1.f;
+            if (fMode == kScaled) {
+                float pk = 0.f;
+                for (int i = n - kPoints - tau; i < n; i++) pk = std::max(pk, std::fabs(fX[i]));
+                target = pk > 1e-9f ? 0.9f / pk : fPhaseGain;
+            }
+            fPhaseGain = (target < fPhaseGain || fMode != kScaled) ? target : fPhaseGain + (target - fPhaseGain) * 0.05f;
+            // the newest kPoints pairs (x(t), x(t + tau)), oldest first
+            fDots.clear();
+            for (int i = n - kPoints - tau; i < n - tau; i++)
+                fDots.emplace_back(fX[i] * fPhaseGain, fX[i + tau] * fPhaseGain);
+            update();
+        }
+
+        // the dots in age bands (oldest first); without phosphor only the newest half.
+        // Opaque dots (accent mixed with the background) without antialiasing: Qt draws
+        // opaque points in batches, transparent ones one by one
+        void paintDots(QPainter& p)
+        {
+            int n = int(fDots.size()), band = n / kBands;
+            QColor bg = FQT_METER_BG, fg = FQT_ACCENT;
+            p.setRenderHint(QPainter::Antialiasing, false);
+            for (int b = fPhosphor ? 0 : kBands / 2; b < kBands; b++) {
+                float t = fPhosphor ? float(b + 1) / kBands : 1.f;
+                t *= t;
+                QColor col(int(bg.red() + (fg.red() - bg.red()) * t), int(bg.green() + (fg.green() - bg.green()) * t),
+                           int(bg.blue() + (fg.blue() - bg.blue()) * t));
+                p.setPen(fqtLinePen(col, 2.0));
+                p.drawPoints(fDots.data() + b * band, (b == kBands - 1) ? n - b * band : band);
+            }
+        }
+
+        void paintPhase(QPainter& p)
+        {
+            QRectF all = QRectF(rect()).adjusted(4, 8, -4, -8);
+            float half = std::min(float(all.width()), float(all.height())) / 2;
+            QPointF c = all.center();
+            p.setRenderHint(QPainter::Antialiasing, true);
+            p.setPen(QPen(FQT_TRACK, 1));
+            p.drawLine(QPointF(c.x() - half, c.y()), QPointF(c.x() + half, c.y()));
+            p.drawLine(QPointF(c.x(), c.y() - half), QPointF(c.x(), c.y() + half));
+            for (QPointF& d : fDots) {
+                float x = std::max(-1.f, std::min(1.f, float(d.x()))), y = std::max(-1.f, std::min(1.f, float(d.y())));
+                d = QPointF(c.x() + x * half, c.y() - y * half);
+            }
+            paintDots(p);
+            // signal and delay, bottom right
+            static const char* names[] = { "L", "R", "Mid" };
+            float ms = fTau * 1000.f / float(fSource.fSampleRate);
+            QString t = QString("%1  τ %2 ms%3").arg(names[fSignal])
+                        .arg(ms < 1.f ? QString::number(ms, 'f', 2) : QString::number(ms, 'f', 1))
+                        .arg(fDelayUs ? "" : " auto");
+            p.setFont(fqtMeterFont(8));
+            p.setPen(FQT_TEXT_DIM);
+            p.drawText(QRectF(rect()).adjusted(4, 0, -6, -4), Qt::AlignRight | Qt::AlignBottom, t);
+        }
+
     public:
 
         StereoModule(const MeterSource& src) : MeterModule(src, "stereo")
@@ -1230,15 +1308,20 @@ class StereoModule : public MeterModule
             setMinimumWidth(90);
             fMode = option("mode", kScaled) == kLinear ? kLinear : kScaled;
             fPhosphor = option("phosphor", 1);
+            fView = option("view", kStereo) == kPhase ? kPhase : kStereo;
+            fSignal = std::min(2, std::max(0, option("signal", 0)));
+            fDelayUs = std::max(0, option("delay", 0));
         }
 
         virtual std::vector<ChipGroup> chipGroups()
         {
-            return { { "mode", &fMode, { "Scaled", "Linear" }, { kScaled, kLinear } } };
+            return { { "view", &fView, { "Stereo", "Phase" }, { kStereo, kPhase } },
+                     { "mode", &fMode, { "Scaled", "Linear" }, { kScaled, kLinear } } };
         }
 
         virtual void tick()
         {
+            if (fView == kPhase) { tickPhase(); return; }
             fL.resize(kPoints); fR.resize(kPoints);
             fSource.readPair(fL.data(), fR.data(), kPoints);
             double lr = 0, ll = 0, rr = 0;
@@ -1252,6 +1335,11 @@ class StereoModule : public MeterModule
         {
             QPainter p(this);
             paintBackground(p);
+            if (fView == kPhase) {
+                paintPhase(p);
+                paintChips(p);
+                return;
+            }
             QRectF all = QRectF(rect()).adjusted(4, 8, -4, -8);
             p.setFont(fqtMeterFont(9));
             QFontMetrics fm(p.font());
@@ -1294,20 +1382,7 @@ class StereoModule : public MeterModule
                 float x = std::max(-1.f, std::min(1.f, float(m.x()))), y = std::max(-1.f, std::min(1.f, float(m.y())));
                 fDots.emplace_back(c.x() + x * half, c.y() - y * half);
             }
-            // oldest band first; without phosphor only the newest half, at full intensity.
-            // Opaque dots (accent mixed with the background) without antialiasing: Qt draws
-            // opaque points in batches, transparent ones one by one
-            int n = int(fDots.size()), band = n / kBands;
-            QColor bg = FQT_METER_BG, fg = FQT_ACCENT;
-            p.setRenderHint(QPainter::Antialiasing, false);
-            for (int b = fPhosphor ? 0 : kBands / 2; b < kBands; b++) {
-                float t = fPhosphor ? float(b + 1) / kBands : 1.f;
-                t *= t;
-                QColor col(int(bg.red() + (fg.red() - bg.red()) * t), int(bg.green() + (fg.green() - bg.green()) * t),
-                           int(bg.blue() + (fg.blue() - bg.blue()) * t));
-                p.setPen(fqtLinePen(col, 2.0));
-                p.drawPoints(fDots.data() + b * band, (b == kBands - 1) ? n - b * band : band);
-            }
+            paintDots(p);
             paintChips(p);
         }
 };
@@ -1687,7 +1762,6 @@ class FitView : public QGraphicsView
         QGraphicsScene fScene;
         QWidget* fContent;
         QGraphicsProxyWidget* fProxy;
-        int fTop;       // empty band above the controls (title bar buttons)
 
     protected:
 
@@ -1696,11 +1770,9 @@ class FitView : public QGraphicsView
             QGraphicsView::resizeEvent(e);
             QSize natural = fContent->sizeHint().expandedTo(fContent->minimumSizeHint());
             double w = viewport()->width(), h = viewport()->height();
-            double ch = std::max(1.0, h - fTop);
-            double s = std::min(1.0, std::min(w / std::max(1, natural.width()), ch / std::max(1, natural.height())));
+            double s = std::min(1.0, std::min(w / std::max(1, natural.width()), h / std::max(1, natural.height())));
             fProxy->setScale(s);
-            fProxy->setPos(0, fTop);
-            fProxy->resize(w / s, ch / s);  // fills the view at any scale
+            fProxy->resize(w / s, h / s);   // fills the view at any scale
             fScene.setSceneRect(0, 0, w, h);
         }
 
@@ -1709,20 +1781,9 @@ class FitView : public QGraphicsView
             p->fillRect(r, FQT_COLOR(0xf5f5f7, 0x1c1c1e));
         }
 
-        // a press that no control took, in the top band (no title bar): moves the window
-        virtual void mousePressEvent(QMouseEvent* e)
-        {
-            QGraphicsView::mousePressEvent(e);
-            if (!e->isAccepted() && e->button() == Qt::LeftButton
-                && mapTo(window(), e->position().toPoint()).y() < kTitleBand) {
-                e->accept();
-                fqtStartMove(this);
-            }
-        }
-
     public:
 
-        FitView(QWidget* content, int top = 0) : fContent(content), fTop(top)
+        FitView(QWidget* content) : fContent(content)
         {
             setScene(&fScene);
             setFrameShape(QFrame::NoFrame);
@@ -1800,6 +1861,44 @@ class MeterReadout : public QWidget
             p.drawText(text, Qt::AlignCenter, fText);
             if (fHover) p.drawText(QRect(text.right(), 0, 12, height()), Qt::AlignCenter, QString::fromUtf8("\u25B8"));
         }
+};
+
+/**
+ * Divider between the strip and the controls: a thin bar of the window color
+ * with a small grip in the middle (it must be painted to receive the mouse).
+ */
+class MeterSplitterHandle : public QSplitterHandle
+{
+
+    public:
+
+        MeterSplitterHandle(Qt::Orientation o, QSplitter* parent) : QSplitterHandle(o, parent)
+        {
+            setCursor(Qt::SizeVerCursor);
+            setToolTip("Drag to resize the meters, up to close them");
+        }
+
+        virtual void paintEvent(QPaintEvent*)
+        {
+            QPainter p(this);
+            p.fillRect(rect(), FQT_COLOR(0xf5f5f7, 0x1c1c1e));
+            p.setRenderHint(QPainter::Antialiasing, true);
+            p.setPen(Qt::NoPen);
+            p.setBrush(FQT_BORDER);
+            p.drawRoundedRect(QRectF(width() / 2.0 - 18, height() / 2.0 - 1.5, 36, 3), 1.5, 1.5);
+        }
+};
+
+class MeterSplitter : public QSplitter
+{
+
+    protected:
+
+        virtual QSplitterHandle* createHandle() { return new MeterSplitterHandle(orientation(), this); }
+
+    public:
+
+        MeterSplitter() : QSplitter(Qt::Vertical) {}
 };
 
 /**
@@ -2216,21 +2315,15 @@ class MeterColumns : public QSplitter
 };
 
 /**
- * The meters: a floating window (MiniMeters style strip) above the window of
- * the application, shown and hidden by the round button on the left of the
- * theme button, in the top right corner of the application window. It
- * stays in front of the other windows (as MiniMeters), can be moved and
- * resized freely, and remembers its geometry and whether it was open. While it is
- * hidden nothing is analysed or drawn (the audio thread still copies the
- * buffers into the rings: a few memory copies per block).
+ * The strip: the modules side by side (MiniMeters horizontal layout) in four
+ * resizable columns (MeterColumns): waveform | levels + stereometer |
+ * oscilloscope | spectrum, with a round gear button in the top left corner
+ * (routing in its tooltip) that opens the routing matrix. It sits in a
+ * vertical splitter above the controls: drag the divider to resize it, up to
+ * close it (no analysis, no drawing), down to reopen it (height saved per
+ * application). Frames at 60 fps from a precise timer.
  *
- * The modules, side by side in resizable columns (MeterColumns), separated by
- * 1 px lines shown only while the mouse is over the window: waveform, levels +
- * stereometer, oscilloscope, spectrum. A round button with a gear in the top
- * left corner (routing in its tooltip) opens the routing matrix. Frames at
- * 60 fps from a precise timer.
- *
- * The status bar sits at the bottom of the application window, always shown.
+ * The status bar sits at the bottom of the window, always shown.
  *
  * Usage (see ca-qt-meters.cpp):
  *      MetersPanel* meters = MetersPanel::attach(window, meterDSP, sample_rate);   // before QTGUI::run()
@@ -2243,24 +2336,22 @@ class MetersPanel : public QWidget
     public:
 
         static const int kHeight = 170;     // default height
-        static const int kMinHeight = 80;
+        static const int kMinHeight = 80;   // below this, dragging the divider closes the strip
+        static const int kMaxHeight = 600;
 
     private:
 
         MeterSource fSource;
         std::vector<MeterModule*> fModules;
+        QTimer fTimer;
         QToolButton* fRoutingButton;
         LevelsModule* fLevels = nullptr;
         MeterReadout* fReadout = nullptr;
         QMainWindow* fWindow = nullptr;
-        QToolButton* fToggle = nullptr;
+        QSplitter* fSplitter = nullptr;
         MeterColumns* fColumns = nullptr;
-        bool fStripHover = false;           // mouse over the window: borders shown
+        bool fStripHover = false;           // mouse over the strip: borders shown
         MeterStatusBar* fStatus = nullptr;
-        QTimer fTimer;
-        QTimer fTitlePoll;                  // runs only while the mouse is over one of the windows
-        bool fMainTitle = true;             // title bar buttons shown (the native default)
-        bool fMetersTitle = true;
 
         static QSettings settings() { return QSettings("Faust", QCoreApplication::applicationName()); }
 
@@ -2314,115 +2405,34 @@ class MetersPanel : public QWidget
             settings().setValue("meters/columns4", l.join(","));
         }
 
-        // one frame: analysis, readout, borders (only while the window is shown)
+        bool isOpen() const { return fSplitter && fSplitter->sizes().value(0) > 0; }
+
+        void saveState()
+        {
+            int h = fSplitter->sizes().value(0);
+            // closed strip: hide the modules, so that nothing is drawn or composited
+            for (MeterModule* m : fModules) m->setVisible(h > 0);
+            settings().setValue("meters/height", h);
+        }
+
+        // one frame: analysis, readout, borders (only while the strip is open)
         void frame()
         {
-            if (!isVisible() || isMinimized()) return;
+            if (!isVisible() || (fSplitter && !isOpen())) return;
             for (MeterModule* m : fModules) m->tick();
             placeReadout();
-            // borders of the modules: shown only while the mouse is over the window
+            // borders of the modules: shown only while the mouse is over the strip
             bool hover = underMouse();
             if (hover != fStripHover) {
                 fStripHover = hover;
                 fColumns->setShowLines(hover);
-                fRoutingButton->setVisible(hover || !FQT_TITLE_ON_HOVER);   // with the mode chips
                 update();
             }
         }
 
-        // title bar buttons of each window: shown while the mouse is over its top band
-        void titlePoll()
-        {
-            QPoint g = QCursor::pos();
-            bool inside = false;
-            auto check = [&](QWidget* w, bool& shown) {
-                if (!w || !w->isVisible()) return;
-                QPoint l = w->mapFromGlobal(g);
-                bool in = w->rect().contains(l);
-                inside |= in;
-                bool want = in && l.y() < kTitleBand;
-                if (want != shown) {
-                    shown = want;
-                    fqtTitleButtons(w, want);
-                }
-            };
-            check(fWindow, fMainTitle);
-            check(this, fMetersTitle);
-            if (!inside) fTitlePoll.stop();
-        }
-
-        // hide the buttons once the native window exists (and again after any change Qt makes)
-        void hideTitle(QWidget* w, bool& shown)
-        {
-            QTimer::singleShot(0, this, [this, w, &shown]() {
-                shown = false;
-                fqtTitleButtons(w, false);
-                titlePoll();
-            });
-        }
-
-        // position and size; 'open' is saved only when the user shows or hides the window
-        void saveGeometryState(bool open)
-        {
-            settings().setValue("meters/window", saveGeometry());
-            settings().setValue("meters/open", open);
-        }
-
-        // the toggle sits on the left of the theme button of QTUI.h (22 px wide, 6 px from the edge)
-        void placeToggle()
-        {
-            if (fToggle && fWindow) {
-                fToggle->move(fWindow->width() - 22 - 6 - fToggle->width() - 6, 4);
-                fToggle->raise();
-            }
-        }
-
-        void updateToggle()
-        {
-            if (fToggle) fToggle->setToolTip(isVisible() ? "Hide the meters" : "Show the meters");
-        }
-
-    protected:
-
-        virtual void showEvent(QShowEvent* e)
-        {
-            QWidget::showEvent(e);
-            updateToggle();
-            hideTitle(this, fMetersTitle);
-            // repaint at once (no analysis while the window was hidden)
-            for (MeterModule* m : fModules) m->update();
-        }
-
-        virtual void changeEvent(QEvent* e)
-        {
-            QWidget::changeEvent(e);
-            if (e->type() == QEvent::WindowStateChange && isVisible()) hideTitle(this, fMetersTitle);
-        }
-
-        virtual void enterEvent(QEnterEvent* e)
-        {
-            QWidget::enterEvent(e);
-            if (FQT_TITLE_ON_HOVER && !fTitlePoll.isActive()) fTitlePoll.start();
-        }
-
-        virtual void hideEvent(QHideEvent* e)
-        {
-            QWidget::hideEvent(e);
-            updateToggle();
-        }
-
-        virtual void closeEvent(QCloseEvent* e)
-        {
-            // closed (hidden, not deleted): by its close button, or because the application
-            // quits; 'closed' is remembered only in the first case (the application still runs)
-            QWidget::closeEvent(e);
-            QTimer::singleShot(100, this, [this]() { if (fWindow && fWindow->isVisible()) saveGeometryState(false); });
-        }
-
     public:
 
-        // a normal window (full size title bar buttons), always in front, as MiniMeters
-        MetersPanel(MeterDSP* dsp, int sample_rate, QWidget* parent = nullptr) : QWidget(parent, Qt::Window | Qt::WindowStaysOnTopHint)
+        MetersPanel(MeterDSP* dsp, int sample_rate, QWidget* parent = nullptr) : QWidget(parent)
         {
             fSource.fDSP = dsp;
             fSource.fSampleRate = sample_rate > 0 ? sample_rate : 48000;
@@ -2432,14 +2442,11 @@ class MetersPanel : public QWidget
                 fSource.load(MeterSource::kLeft, st.value("meters/route_l").toString());
                 fSource.load(MeterSource::kRight, st.value("meters/route_r").toString());
             }
-            setWindowTitle(QCoreApplication::applicationName() + " - meters");
-            setMinimumSize(360, kMinHeight);
-            fqtExpandTitleBar(this);
-            fTitlePoll.setInterval(40);
-            QObject::connect(&fTitlePoll, &QTimer::timeout, [this]() { titlePoll(); });
+            setMinimumHeight(kMinHeight);
+            setMaximumHeight(kMaxHeight);
 
             QHBoxLayout* row = new QHBoxLayout(this);
-            row->setContentsMargins(0, 0, 0, 0);
+            row->setContentsMargins(0, 0, 0, 1);    // bottom line
             row->setSpacing(0);
 
             // order and proportions of the MiniMeters horizontal layout, in resizable columns;
@@ -2467,9 +2474,8 @@ class MetersPanel : public QWidget
 
             fReadout = new MeterReadout(this, [this]() { fLevels->nextMode(); });
             fRoutingButton = roundButton(this, 22, QString());
-            fRoutingButton->setText(QString::fromUtf8("\u2699\uFE0E"));     // gear (text style, not emoji)
-            fRoutingButton->move(kGearX, 4);
-            fRoutingButton->setVisible(!FQT_TITLE_ON_HOVER);
+            fRoutingButton->setText(QString::fromUtf8("⚙︎"));     // gear (text style, not emoji)
+            fRoutingButton->move(6, 4);
             QObject::connect(fRoutingButton, &QToolButton::clicked, [this]() { routingMatrix(); });
             routingChanged();
 
@@ -2478,92 +2484,70 @@ class MetersPanel : public QWidget
             fTimer.setTimerType(Qt::PreciseTimer);
             QObject::connect(&fTimer, &QTimer::timeout, [this]() { frame(); });
             fTimer.start(kMeterFrameMs);
-            setAttribute(Qt::WA_QuitOnClose, false);    // closing the application window quits, as before
-            QObject::connect(qApp, &QCoreApplication::aboutToQuit, [this]() { settings().setValue("meters/window", saveGeometry()); });
         }
 
         /**
-         * Make the meters a floating window over the QTGUI window, add the status bar
-         * and the round button that shows and hides the meters
+         * Put the strip above the controls of the QTGUI window, in a splitter, and the status bar below
          */
         static MetersPanel* attach(QWidget* window, MeterDSP* dsp, int sample_rate)
         {
-            QMainWindow* main = qobject_cast<QMainWindow*>(window);
-            MetersPanel* panel = new MetersPanel(dsp, sample_rate, window);
-            panel->fWindow = main;
-            if (!main) return panel;
+            MetersPanel* panel = new MetersPanel(dsp, sample_rate);
+            panel->fWindow = qobject_cast<QMainWindow*>(window);
+            if (!panel->fWindow) return panel;
 
             // the controls: QTGUI, taken out of its scroll area and shown in a FitView
-            QWidget* controls = main->takeCentralWidget();
+            QWidget* controls = panel->fWindow->takeCentralWidget();
             QScrollArea* scroll = qobject_cast<QScrollArea*>(controls);
             if (scroll && scroll->widget()) {
                 QWidget* gui = scroll->takeWidget();
                 // extra height goes below the controls instead of stretching their groups
                 if (QBoxLayout* box = qobject_cast<QBoxLayout*>(gui->layout())) box->addStretch(1);
-                controls = new FitView(gui, FQT_TITLE_ON_HOVER ? 8 : 0);    // clear of the title bar buttons
+                controls = new FitView(gui);
                 scroll->deleteLater();
             }
-            // controls and status bar
+            panel->fSplitter = new MeterSplitter();
+            panel->fSplitter->setHandleWidth(7);
+            panel->fSplitter->addWidget(panel);
+            panel->fSplitter->addWidget(controls);
+            panel->fSplitter->setCollapsible(0, true);
+            panel->fSplitter->setCollapsible(1, false);
+            // the status bar below everything
             QWidget* central = new QWidget();
             QVBoxLayout* column = new QVBoxLayout(central);
             column->setContentsMargins(0, 0, 0, 0);
             column->setSpacing(0);
-            column->addWidget(controls, 1);
+            column->addWidget(panel->fSplitter, 1);
             panel->fStatus = new MeterStatusBar(dsp->timing(), panel->fSource.fSampleRate,
                                                 dsp->inputs().channels(), dsp->outputs().channels());
             column->addWidget(panel->fStatus);
-            main->setCentralWidget(central);
-
-            fqtExpandTitleBar(main);
-            panel->fToggle = panel->roundButton(main, 22, "Show the meters");
-            panel->fToggle->setText(QString::fromUtf8("\u223F"));     // sine wave
-            main->installEventFilter(panel);    // keeps the button on the left of the theme button
-            QObject::connect(panel->fToggle, &QToolButton::clicked, [panel]() {
-                panel->setVisible(!panel->isVisible());
-                if (panel->isVisible()) panel->raise();
-                panel->saveGeometryState(panel->isVisible());
-            });
+            panel->fWindow->setCentralWidget(central);
+            QObject::connect(panel->fSplitter, &QSplitter::splitterMoved, [panel]() { panel->saveState(); });
             return panel;
         }
 
         /**
-         * After QTGUI::run(): room for the status bar, then the meters window where it was
-         * (by default right above the application window, as wide)
+         * QTGUI::run() fits the window to the controls only: make room for the strip
          */
         void fitWindow()
         {
             if (!fWindow) return;
-            fWindow->resize(std::max(fWindow->width(), 520), fWindow->height() + (fStatus ? fStatus->height() : 0));
-            placeToggle();
-            if (!restoreGeometry(settings().value("meters/window").toByteArray())) {
-                QRect f = fWindow->frameGeometry();
-                QScreen* screen = fWindow->screen();
-                int top = screen ? screen->availableGeometry().top() : 0;
-                int title = f.height() - fWindow->height();     // height of a title bar (0 without one)
-                if (title < 20 && !FQT_TITLE_ON_HOVER) title = 32;
-                int y = std::max(top + title, f.top() - kHeight);     // contents, title bar above them
-                setGeometry(f.left(), y, std::max(fWindow->width(), 760), kHeight);
-            }
-            setVisible(settings().value("meters/open", true).toBool());
-            updateToggle();
-        }
-
-        bool eventFilter(QObject* obj, QEvent* event) override
-        {
-            if (obj == fWindow) {
-                if (event->type() == QEvent::Resize) placeToggle();
-                if (event->type() == QEvent::Show || event->type() == QEvent::WindowStateChange) hideTitle(fWindow, fMainTitle);
-                if (event->type() == QEvent::Enter && FQT_TITLE_ON_HOVER && !fTitlePoll.isActive()) fTitlePoll.start();
-            }
-            return QWidget::eventFilter(obj, event);
+            int h = settings().value("meters/height", kHeight).toInt();
+            QScreen* screen = QGuiApplication::primaryScreen();
+            int maxH = screen ? screen->availableGeometry().height() - 40 : 900;
+            int controls = fWindow->height();      // the window was fitted to the controls by QTGUI::run()
+            int status = fStatus ? fStatus->height() : 0;
+            fWindow->resize(std::max(fWindow->width(), 760), std::min(controls + h + fSplitter->handleWidth() + status, maxH));
+            fSplitter->setSizes({ h, controls });   // rescaled by the splitter if the screen is too small
+            saveState();
         }
 
         virtual void paintEvent(QPaintEvent*)
         {
-            // separator between the levels and the stereometer: shown with the borders of the
-            // columns, otherwise the background of the modules
+            // separator between the levels and the stereometer (shown with the borders of the
+            // columns, otherwise the background of the modules) and bottom line
             QPainter p(this);
             p.fillRect(rect(), fStripHover ? FQT_BORDER : FQT_METER_BG);
+            p.fillRect(QRectF(0, height() - 1, width(), 1), FQT_BORDER);
         }
 };
 
